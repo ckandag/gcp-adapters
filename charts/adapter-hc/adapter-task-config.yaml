@@ -199,46 +199,47 @@ spec:
             hyperfleet.io/cluster-id: "{{ .clusterId }}"
 
     # --- Resource 3: API Server Certificate ---
-    - name: "apiCertificate"
-      transport:
-        client: "kubernetes"
-      manifest:
-        apiVersion: cert-manager.io/v1
-        kind: Certificate
-        metadata:
-          name: external-api-cert
-          namespace: "clusters-{{ .clusterId }}"
-          labels:
-            hyperfleet.io/cluster-id: "{{ .clusterId }}"
-            hyperfleet.io/managed-by: "adapter-hc"
-        spec:
-          subject:
-            organizations:
-              - "Red Hat - Hypershift"
-          usages:
-            - server auth
-            - client auth
-          duration: 2160h
-          renewBefore: 720h
-          privateKey:
-            algorithm: RSA
-            encoding: PKCS1
-            size: 2048
-            rotationPolicy: Always
-          dnsNames:
-            - "*.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
-          secretName: external-api-cert
-          issuerRef:
-            name: public-issuer
-            kind: ClusterIssuer
-            group: cert-manager.io
-      discovery:
-        namespace: "clusters-{{ .clusterId }}"
-        bySelectors:
-          labelSelector:
-            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+    # TEMPORARILY DISABLED: cert-manager not installed on management cluster
+    # - name: "apiCertificate"
+    #   transport:
+    #     client: "kubernetes"
+    #   manifest:
+    #     apiVersion: cert-manager.io/v1
+    #     kind: Certificate
+    #     metadata:
+    #       name: external-api-cert
+    #       namespace: "clusters-{{ .clusterId }}"
+    #       labels:
+    #         hyperfleet.io/cluster-id: "{{ .clusterId }}"
+    #         hyperfleet.io/managed-by: "adapter-hc"
+    #     spec:
+    #       subject:
+    #         organizations:
+    #           - "Red Hat - Hypershift"
+    #       usages:
+    #         - server auth
+    #         - client auth
+    #       duration: 2160h
+    #       renewBefore: 720h
+    #       privateKey:
+    #         algorithm: RSA
+    #         encoding: PKCS1
+    #         size: 2048
+    #         rotationPolicy: Always
+    #       dnsNames:
+    #         - "*.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
+    #       secretName: external-api-cert
+    #       issuerRef:
+    #         name: public-issuer
+    #         kind: ClusterIssuer
+    #         group: cert-manager.io
+    #   discovery:
+    #     namespace: "clusters-{{ .clusterId }}"
+    #     bySelectors:
+    #       labelSelector:
+    #         hyperfleet.io/cluster-id: "{{ .clusterId }}"
 
-    # --- Resource 4: HostedCluster ---
+    # --- Resource 3: HostedCluster ---
     - name: "hostedCluster"
       transport:
         client: "kubernetes"
