@@ -254,11 +254,12 @@ spec:
           annotations:
             hypershift.openshift.io/pod-security-admission-label-override: baseline
             hypershift.openshift.io/skip-kas-conflict-san-validation: "true"
+            hypershift.openshift.io/control-plane-operator-image: "quay.io/cveiga/hypershift:latest"
         spec:
           release:
             image: "{{ .releaseImage }}"
 
-          controllerAvailabilityPolicy: HighlyAvailable
+              controllerAvailabilityPolicy: SingleReplica
 
           platform:
             type: GCP

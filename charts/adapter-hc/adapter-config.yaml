@@ -26,4 +26,4 @@ spec:
     kubernetes:
       apiVersion: "v1"
       # Remote kubeconfig for management cluster, mounted from mc-cluster-secret
-      kubeConfigPath: /etc/adapter/kubeconfig
+      kubeConfigPath: /etc/mc-kubeconfig/kubeconfig

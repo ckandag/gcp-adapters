@@ -1,5 +1,4 @@
 # Default values for adapter-hc (HostedCluster adapter)
-# Uses the hyperfleet-adapter chart as a subchart dependency.
 
 hyperfleet-adapter:
   image:
@@ -10,13 +9,11 @@ hyperfleet-adapter:
 
   adapterConfig:
     create: true
-    files:
-      adapter-config.yaml: adapter-config.yaml
+    # yaml is injected via --set-file or ArgoCD fileParameters
 
   adapterTaskConfig:
     create: true
-    files:
-      task-config.yaml: adapter-task-config.yaml
+    # yaml is injected via --set-file or ArgoCD fileParameters
 
   broker:
     create: true
@@ -54,7 +51,7 @@ hyperfleet-adapter:
 
   extraVolumeMounts:
     - name: kubeconfig
-      mountPath: /etc/adapter
+      mountPath: /etc/mc-kubeconfig
       readOnly: true
 
   extraVolumes:
