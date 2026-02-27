@@ -101,6 +101,10 @@ spec:
         - name: "storageEmail"
           expression: "spec.platform.gcp.workloadIdentity.serviceAccountsRef.storageEmail"
 
+        # RFC4122 UUID for HostedCluster spec.clusterID
+        - name: "hcClusterID"
+          expression: "has(spec.clusterID) ? spec.clusterID : id"
+
         # Ready condition check
         - name: "readyConditionStatus"
           expression: |
@@ -110,7 +114,7 @@ spec:
 
         # Compute slug from email (username part before @)
         - name: "slug"
-          expression: "created_by.split('@')[0]"
+          expression: "has(created_by) && created_by.contains('@') ? created_by.substring(0, created_by.indexOf('@')) : 'user'"
 
       conditions:
         - field: "readyConditionStatus"
@@ -312,7 +316,7 @@ spec:
                 type: Route
 
           infraID: "{{ .infraID }}"
-          clusterID: "{{ .clusterId }}"
+          clusterID: "{{ .hcClusterID }}"
 
           dns:
             baseDomain: "in.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
