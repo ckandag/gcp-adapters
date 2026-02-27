@@ -259,7 +259,7 @@ spec:
           release:
             image: "{{ .releaseImage }}"
 
-              controllerAvailabilityPolicy: SingleReplica
+          controllerAvailabilityPolicy: SingleReplica
 
           platform:
             type: GCP
