@@ -114,7 +114,7 @@ spec:
 
         # Compute slug from email (username part before @)
         - name: "slug"
-          expression: "created_by.contains('@') ? created_by.substring(0, created_by.indexOf('@')) : 'user'"
+          expression: "created_by.contains('@') ? created_by.split('@')[0] : 'user'"
 
       conditions:
         - field: "readyConditionStatus"
