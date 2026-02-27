@@ -1,0 +1,471 @@
+# HyperFleet Adapter - HostedCluster task configuration
+# Equivalent of cls-hypershift-client: creates Namespace, pull-secret, signing-key,
+# Certificate, and HostedCluster on the management cluster.
+apiVersion: hyperfleet.redhat.com/v1alpha1
+kind: AdapterTaskConfig
+metadata:
+  name: adapter-hc
+  labels:
+    hyperfleet.io/adapter-type: adapter-hc
+    hyperfleet.io/component: adapter
+spec:
+  # ============================================================================
+  # Phase 1: Parameter extraction
+  # ============================================================================
+  params:
+    - name: "clusterId"
+      source: "event.id"
+      type: "string"
+      required: true
+
+    - name: "generation"
+      source: "event.generation"
+      type: "int"
+      required: true
+
+    - name: "namespace"
+      source: "env.NAMESPACE"
+      type: "string"
+
+    - name: "baseDomain"
+      source: "env.HC_BASE_DOMAIN"
+      type: "string"
+      required: true
+      description: "Base domain for hosted cluster DNS (e.g. hc-us-central1-nkcw.int.gcp-hcp.devshift.net)"
+
+    - name: "releaseImage"
+      source: "env.HC_RELEASE_IMAGE"
+      type: "string"
+      default: "quay.io/openshift-release-dev/ocp-release:4.20.0-x86_64"
+
+    - name: "pullSecretStoreName"
+      source: "env.PULL_SECRET_STORE_NAME"
+      type: "string"
+      default: "global-gcp-secret-manager"
+
+    - name: "pullSecretGcpKey"
+      source: "env.PULL_SECRET_GCP_KEY"
+      type: "string"
+      default: "openshift-pull-secret"
+
+  # ============================================================================
+  # Phase 2: Preconditions - fetch cluster details from HyperFleet API
+  # ============================================================================
+  preconditions:
+    - name: "clusterDetails"
+      apiCall:
+        method: "GET"
+        url: "/clusters/{{ .clusterId }}"
+        timeout: 10s
+        retryAttempts: 3
+        retryBackoff: "exponential"
+      capture:
+        - name: "clusterName"
+          field: "name"
+        - name: "generation"
+          field: "generation"
+        - name: "createdBy"
+          field: "created_by"
+        - name: "infraID"
+          expression: "spec.infraID"
+        - name: "issuerURL"
+          expression: "has(spec.issuerURL) ? spec.issuerURL : ''"
+        - name: "serviceAccountSigningKey"
+          expression: "has(spec.serviceAccountSigningKey) ? spec.serviceAccountSigningKey : ''"
+
+        # GCP platform fields
+        - name: "gcpProjectID"
+          expression: "spec.platform.gcp.projectID"
+        - name: "gcpRegion"
+          expression: "spec.platform.gcp.region"
+        - name: "gcpNetwork"
+          expression: "spec.platform.gcp.network"
+        - name: "gcpSubnet"
+          expression: "spec.platform.gcp.subnet"
+        - name: "gcpEndpointAccess"
+          expression: "has(spec.platform.gcp.endpointAccess) ? spec.platform.gcp.endpointAccess : 'Private'"
+
+        # WIF fields
+        - name: "wifProjectNumber"
+          expression: "spec.platform.gcp.workloadIdentity.projectNumber"
+        - name: "wifPoolID"
+          expression: "spec.platform.gcp.workloadIdentity.poolID"
+        - name: "wifProviderID"
+          expression: "spec.platform.gcp.workloadIdentity.providerID"
+        - name: "nodePoolEmail"
+          expression: "spec.platform.gcp.workloadIdentity.serviceAccountsRef.nodePoolEmail"
+        - name: "controlPlaneEmail"
+          expression: "spec.platform.gcp.workloadIdentity.serviceAccountsRef.controlPlaneEmail"
+        - name: "cloudControllerEmail"
+          expression: "spec.platform.gcp.workloadIdentity.serviceAccountsRef.cloudControllerEmail"
+        - name: "storageEmail"
+          expression: "spec.platform.gcp.workloadIdentity.serviceAccountsRef.storageEmail"
+
+        # Ready condition check
+        - name: "readyConditionStatus"
+          expression: |
+            status.conditions.filter(c, c.type == "Ready").size() > 0
+              ? status.conditions.filter(c, c.type == "Ready")[0].status
+              : "False"
+
+        # Compute slug from email (username part before @)
+        - name: "slug"
+          expression: "created_by.split('@')[0]"
+
+      conditions:
+        - field: "readyConditionStatus"
+          operator: "equals"
+          value: "False"
+
+    - name: "validationCheck"
+      expression: |
+        readyConditionStatus == "False"
+
+  # ============================================================================
+  # Phase 3: Resources - create on management cluster
+  # ============================================================================
+  resources:
+    # --- Resource 0: Namespace ---
+    - name: "clusterNamespace"
+      transport:
+        client: "kubernetes"
+      manifest:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: "clusters-{{ .clusterId }}"
+          labels:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+            hyperfleet.io/cluster-name: "{{ .clusterName }}"
+            hyperfleet.io/managed-by: "adapter-hc"
+          annotations:
+            hyperfleet.io/generation: "{{ .generation }}"
+      discovery:
+        byName: "clusters-{{ .clusterId }}"
+
+    # --- Resource 1: Pull Secret (ExternalSecret) ---
+    - name: "pullSecret"
+      transport:
+        client: "kubernetes"
+      manifest:
+        apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata:
+          name: pull-secret
+          namespace: "clusters-{{ .clusterId }}"
+          labels:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+            hyperfleet.io/managed-by: "adapter-hc"
+        spec:
+          refreshInterval: 1h
+          secretStoreRef:
+            name: "{{ .pullSecretStoreName }}"
+            kind: ClusterSecretStore
+          target:
+            name: pull-secret
+            creationPolicy: Owner
+            template:
+              type: kubernetes.io/dockerconfigjson
+          data:
+            - secretKey: .dockerconfigjson
+              remoteRef:
+                key: "{{ .pullSecretGcpKey }}"
+      discovery:
+        namespace: "clusters-{{ .clusterId }}"
+        bySelectors:
+          labelSelector:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+
+    # --- Resource 2: Signing Key Secret ---
+    - name: "signingKeySecret"
+      transport:
+        client: "kubernetes"
+      manifest:
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: "{{ .clusterName }}-signing-key"
+          namespace: "clusters-{{ .clusterId }}"
+          labels:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+            hyperfleet.io/managed-by: "adapter-hc"
+        type: Opaque
+        data:
+          key: "{{ .serviceAccountSigningKey }}"
+      discovery:
+        namespace: "clusters-{{ .clusterId }}"
+        bySelectors:
+          labelSelector:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+
+    # --- Resource 3: API Server Certificate ---
+    - name: "apiCertificate"
+      transport:
+        client: "kubernetes"
+      manifest:
+        apiVersion: cert-manager.io/v1
+        kind: Certificate
+        metadata:
+          name: external-api-cert
+          namespace: "clusters-{{ .clusterId }}"
+          labels:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+            hyperfleet.io/managed-by: "adapter-hc"
+        spec:
+          subject:
+            organizations:
+              - "Red Hat - Hypershift"
+          usages:
+            - server auth
+            - client auth
+          duration: 2160h
+          renewBefore: 720h
+          privateKey:
+            algorithm: RSA
+            encoding: PKCS1
+            size: 2048
+            rotationPolicy: Always
+          dnsNames:
+            - "*.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
+          secretName: external-api-cert
+          issuerRef:
+            name: public-issuer
+            kind: ClusterIssuer
+            group: cert-manager.io
+      discovery:
+        namespace: "clusters-{{ .clusterId }}"
+        bySelectors:
+          labelSelector:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+
+    # --- Resource 4: HostedCluster ---
+    - name: "hostedCluster"
+      transport:
+        client: "kubernetes"
+      manifest:
+        apiVersion: hypershift.openshift.io/v1beta1
+        kind: HostedCluster
+        metadata:
+          name: "{{ .clusterName }}"
+          namespace: "clusters-{{ .clusterId }}"
+          labels:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+            hyperfleet.io/managed-by: "adapter-hc"
+          annotations:
+            hypershift.openshift.io/pod-security-admission-label-override: baseline
+            hypershift.openshift.io/skip-kas-conflict-san-validation: "true"
+        spec:
+          release:
+            image: "{{ .releaseImage }}"
+
+          controllerAvailabilityPolicy: HighlyAvailable
+
+          platform:
+            type: GCP
+            gcp:
+              project: "{{ .gcpProjectID }}"
+              region: "{{ .gcpRegion }}"
+              networkConfig:
+                network:
+                  name: "{{ .gcpNetwork }}"
+                privateServiceConnectSubnet:
+                  name: "{{ .gcpSubnet }}"
+              endpointAccess: "{{ .gcpEndpointAccess }}"
+              workloadIdentity:
+                projectNumber: "{{ .wifProjectNumber }}"
+                poolID: "{{ .wifPoolID }}"
+                providerID: "{{ .wifProviderID }}"
+                serviceAccountsEmails:
+                  nodePool: "{{ .nodePoolEmail }}"
+                  controlPlane: "{{ .controlPlaneEmail }}"
+                  cloudController: "{{ .cloudControllerEmail }}"
+                  storage: "{{ .storageEmail }}"
+
+          pullSecret:
+            name: pull-secret
+
+          networking:
+            clusterNetwork:
+              - cidr: 10.132.0.0/14
+            serviceNetwork:
+              - cidr: 172.31.0.0/16
+            networkType: OVNKubernetes
+
+          services:
+            - service: APIServer
+              servicePublishingStrategy:
+                type: Route
+                route:
+                  hostname: "api.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
+            - service: OAuthServer
+              servicePublishingStrategy:
+                type: Route
+                route:
+                  hostname: "oauth.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
+            - service: Konnectivity
+              servicePublishingStrategy:
+                type: Route
+            - service: Ignition
+              servicePublishingStrategy:
+                type: Route
+
+          infraID: "{{ .infraID }}"
+          clusterID: "{{ .clusterId }}"
+
+          dns:
+            baseDomain: "in.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
+            baseDomainPrefix: ""
+
+          issuerURL: "{{ .issuerURL }}"
+
+          serviceAccountSigningKey:
+            name: "{{ .clusterName }}-signing-key"
+
+          capabilities:
+            disabled:
+              - ImageRegistry
+
+          configuration:
+            authentication:
+              type: OIDC
+              oidcProviders:
+              - name: google
+                issuer:
+                  issuerURL: https://accounts.google.com
+                  audiences:
+                  - 32555940559.apps.googleusercontent.com
+                claimMappings:
+                  username:
+                    claim: email
+                  groups:
+                    claim: hd
+                    prefix: ""
+
+      discovery:
+        namespace: "clusters-{{ .clusterId }}"
+        bySelectors:
+          labelSelector:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+
+  # ============================================================================
+  # Phase 4: Status reporting
+  # ============================================================================
+  post:
+    payloads:
+      - name: "statusPayload"
+        build:
+          adapter: "adapter-hc"
+          conditions:
+            # Applied: all prerequisite resources + HostedCluster created
+            - type: "Applied"
+              status:
+                expression: |
+                  has(resources.clusterNamespace.metadata.creationTimestamp)
+                    && has(resources.signingKeySecret.metadata.creationTimestamp)
+                    && has(resources.hostedCluster.metadata.creationTimestamp)
+                  ? "True" : "False"
+              reason:
+                expression: |
+                  has(resources.clusterNamespace.metadata.creationTimestamp)
+                    && has(resources.signingKeySecret.metadata.creationTimestamp)
+                    && has(resources.hostedCluster.metadata.creationTimestamp)
+                  ? "ResourcesCreated" : "ResourcesNotCreated"
+              message:
+                expression: |
+                  has(resources.clusterNamespace.metadata.creationTimestamp)
+                    && has(resources.signingKeySecret.metadata.creationTimestamp)
+                    && has(resources.hostedCluster.metadata.creationTimestamp)
+                  ? "All resources created: Namespace, pull-secret, signing-key, Certificate, HostedCluster"
+                  : "Waiting for resources to be created"
+
+            # Available: HostedCluster Available condition
+            - type: "Available"
+              status:
+                expression: |
+                  has(resources.hostedCluster)
+                    && has(resources.hostedCluster.status)
+                    && has(resources.hostedCluster.status.conditions)
+                    && resources.hostedCluster.status.conditions.filter(c, c.type == "Available").size() > 0
+                  ? resources.hostedCluster.status.conditions.filter(c, c.type == "Available")[0].status
+                  : "Unknown"
+              reason:
+                expression: |
+                  has(resources.hostedCluster)
+                    && has(resources.hostedCluster.status)
+                    && has(resources.hostedCluster.status.conditions)
+                    && resources.hostedCluster.status.conditions.filter(c, c.type == "Available").size() > 0
+                  ? resources.hostedCluster.status.conditions.filter(c, c.type == "Available")[0].reason
+                  : "ConditionNotFound"
+              message:
+                expression: |
+                  has(resources.hostedCluster)
+                    && has(resources.hostedCluster.status)
+                    && has(resources.hostedCluster.status.conditions)
+                    && resources.hostedCluster.status.conditions.filter(c, c.type == "Available").size() > 0
+                  ? resources.hostedCluster.status.conditions.filter(c, c.type == "Available")[0].message
+                  : "HostedCluster Available condition not yet reported"
+
+            # Health: HostedCluster not degraded
+            - type: "Health"
+              status:
+                expression: |
+                  has(resources.hostedCluster)
+                    && has(resources.hostedCluster.status)
+                    && has(resources.hostedCluster.status.conditions)
+                    && resources.hostedCluster.status.conditions.filter(c, c.type == "Degraded").size() > 0
+                  ? (resources.hostedCluster.status.conditions.filter(c, c.type == "Degraded")[0].status == "False" ? "True" : "False")
+                  : "Unknown"
+              reason:
+                expression: |
+                  has(resources.hostedCluster)
+                    && has(resources.hostedCluster.status)
+                    && has(resources.hostedCluster.status.conditions)
+                    && resources.hostedCluster.status.conditions.filter(c, c.type == "Degraded").size() > 0
+                  ? (resources.hostedCluster.status.conditions.filter(c, c.type == "Degraded")[0].status == "False"
+                      ? "NotDegraded"
+                      : resources.hostedCluster.status.conditions.filter(c, c.type == "Degraded")[0].reason)
+                  : "ConditionNotFound"
+              message:
+                expression: |
+                  has(resources.hostedCluster)
+                    && has(resources.hostedCluster.status)
+                    && has(resources.hostedCluster.status.conditions)
+                    && resources.hostedCluster.status.conditions.filter(c, c.type == "Degraded").size() > 0
+                  ? (resources.hostedCluster.status.conditions.filter(c, c.type == "Degraded")[0].status == "False"
+                      ? "HostedCluster is healthy"
+                      : resources.hostedCluster.status.conditions.filter(c, c.type == "Degraded")[0].message)
+                  : "Degraded condition not yet reported"
+
+          observed_generation:
+            expression: "generation"
+          observed_time: "{{ now | date \"2006-01-02T15:04:05Z07:00\" }}"
+
+          data:
+            hostedCluster:
+              name:
+                expression: |
+                  resources.?hostedCluster.?metadata.?name.orValue("")
+              apiEndpoint:
+                expression: |
+                  has(resources.hostedCluster)
+                    && has(resources.hostedCluster.status)
+                    && has(resources.hostedCluster.status.controlPlaneEndpoint)
+                    && has(resources.hostedCluster.status.controlPlaneEndpoint.host)
+                  ? "https://" + resources.hostedCluster.status.controlPlaneEndpoint.host
+                      + ":" + string(resources.hostedCluster.status.controlPlaneEndpoint.port)
+                  : ""
+              version:
+                expression: |
+                  resources.?hostedCluster.?status.?version.?history.orValue([]).size() > 0
+                  ? resources.hostedCluster.status.version.history[0].version
+                  : ""
+
+    postActions:
+      - name: "reportClusterStatus"
+        apiCall:
+          method: "POST"
+          url: "/clusters/{{ .clusterId }}/statuses"
+          headers:
+            - name: "Content-Type"
+              value: "application/json"
+          body: "{{ .statusPayload }}"

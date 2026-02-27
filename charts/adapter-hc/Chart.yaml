@@ -1,0 +1,6 @@
+apiVersion: v2
+name: adapter-hc
+description: HostedCluster adapter - deploys HostedCluster and supporting resources to management cluster
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

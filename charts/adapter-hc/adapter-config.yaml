@@ -1,0 +1,29 @@
+# HyperFleet Adapter - HostedCluster deployment configuration
+# This adapter creates HostedCluster and supporting resources on the management cluster.
+apiVersion: hyperfleet.redhat.com/v1alpha1
+kind: AdapterConfig
+metadata:
+  name: adapter-hc
+  labels:
+    hyperfleet.io/adapter-type: kubernetes
+    hyperfleet.io/component: adapter
+spec:
+  adapter:
+    version: "0.1.0"
+
+  debugConfig: true
+  log:
+    level: debug
+
+  clients:
+    hyperfleetApi:
+      baseUrl: http://hyperfleet-api:8000
+      version: v1
+      timeout: 10s
+      retryAttempts: 3
+      retryBackoff: exponential
+
+    kubernetes:
+      apiVersion: "v1"
+      # Remote kubeconfig for management cluster, mounted from mc-cluster-secret
+      kubeConfigPath: /etc/adapter/kubeconfig
