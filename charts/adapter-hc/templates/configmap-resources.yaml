@@ -5,9 +5,11 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: adapter-hc
-    app.kubernetes.io/component: adapter-resources
+    app.kubernetes.io/component: adapter-task-config
     app.kubernetes.io/managed-by: {{ .Release.Service }}
 data:
+  task-config.yaml: |
+    {{- (index .Values "hyperfleet-adapter").adapterTaskConfig.yaml | nindent 4 }}
   namespace.yaml: |
     {{- .Files.Get "adapter-task-resource-namespace.yaml" | nindent 4 }}
   pull-secret.yaml: |

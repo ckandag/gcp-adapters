@@ -135,7 +135,7 @@ spec:
       transport:
         client: "kubernetes"
       manifest:
-        ref: "/etc/adapter-resources/namespace.yaml"
+        ref: "/etc/adapter/namespace.yaml"
       discovery:
         namespace: "*"
         bySelectors:
@@ -148,7 +148,7 @@ spec:
       transport:
         client: "kubernetes"
       manifest:
-        ref: "/etc/adapter-resources/pull-secret.yaml"
+        ref: "/etc/adapter/pull-secret.yaml"
       discovery:
         namespace: "clusters-{{ .clusterId }}"
         bySelectors:
@@ -161,7 +161,7 @@ spec:
       transport:
         client: "kubernetes"
       manifest:
-        ref: "/etc/adapter-resources/signing-key.yaml"
+        ref: "/etc/adapter/signing-key.yaml"
       discovery:
         namespace: "clusters-{{ .clusterId }}"
         bySelectors:
@@ -174,7 +174,7 @@ spec:
       transport:
         client: "kubernetes"
       manifest:
-        ref: "/etc/adapter-resources/certificate.yaml"
+        ref: "/etc/adapter/certificate.yaml"
       discovery:
         namespace: "clusters-{{ .clusterId }}"
         bySelectors:
@@ -187,7 +187,7 @@ spec:
       transport:
         client: "kubernetes"
       manifest:
-        ref: "/etc/adapter-resources/hostedcluster.yaml"
+        ref: "/etc/adapter/hostedcluster.yaml"
       discovery:
         namespace: "clusters-{{ .clusterId }}"
         bySelectors:

@@ -12,8 +12,8 @@ hyperfleet-adapter:
     # injected via ArgoCD fileParameters
 
   adapterTaskConfig:
-    create: true
-    # injected via ArgoCD fileParameters
+    create: false
+    configMapName: adapter-hc-resources
 
   broker:
     create: true
@@ -53,9 +53,6 @@ hyperfleet-adapter:
     - name: kubeconfig
       mountPath: /etc/mc-kubeconfig
       readOnly: true
-    - name: adapter-resources
-      mountPath: /etc/adapter-resources
-      readOnly: true
 
   extraVolumes:
     - name: kubeconfig
@@ -64,6 +61,3 @@ hyperfleet-adapter:
         items:
           - key: kubeconfig
             path: kubeconfig
-    - name: adapter-resources
-      configMap:
-        name: adapter-hc-resources
