@@ -135,7 +135,7 @@ spec:
       transport:
         client: "kubernetes"
       manifest:
-        ref: "/etc/adapter/namespace.yaml"
+        ref: "/etc/adapter-resources/namespace.yaml"
       discovery:
         namespace: "*"
         bySelectors:
@@ -148,7 +148,7 @@ spec:
       transport:
         client: "kubernetes"
       manifest:
-        ref: "/etc/adapter/pull-secret.yaml"
+        ref: "/etc/adapter-resources/pull-secret.yaml"
       discovery:
         namespace: "clusters-{{ .clusterId }}"
         bySelectors:
@@ -161,7 +161,7 @@ spec:
       transport:
         client: "kubernetes"
       manifest:
-        ref: "/etc/adapter/signing-key.yaml"
+        ref: "/etc/adapter-resources/signing-key.yaml"
       discovery:
         namespace: "clusters-{{ .clusterId }}"
         bySelectors:
@@ -174,7 +174,7 @@ spec:
       transport:
         client: "kubernetes"
       manifest:
-        ref: "/etc/adapter/certificate.yaml"
+        ref: "/etc/adapter-resources/certificate.yaml"
       discovery:
         namespace: "clusters-{{ .clusterId }}"
         bySelectors:
@@ -187,7 +187,7 @@ spec:
       transport:
         client: "kubernetes"
       manifest:
-        ref: "/etc/adapter/hostedcluster.yaml"
+        ref: "/etc/adapter-resources/hostedcluster.yaml"
       discovery:
         namespace: "clusters-{{ .clusterId }}"
         bySelectors:
@@ -216,7 +216,9 @@ spec:
                   ? "ResourcesCreated" : "ResourcesNotCreated"
               message:
                 expression: |
-                  has(resources.clusterNamespace) && has(resources.signingKeySecret) && has(resources.hostedCluster)
+                  has(resources.clusterNamespace.metadata.creationTimestamp)
+                    && has(resources.signingKeySecret.metadata.creationTimestamp)
+                    && has(resources.hostedCluster.metadata.creationTimestamp)
                   ? "All resources created: Namespace, pull-secret, signing-key, Certificate, HostedCluster"
                   : "Waiting for resources to be created"
 

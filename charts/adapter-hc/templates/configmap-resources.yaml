@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adapter-hc-resources
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: adapter-hc
+    app.kubernetes.io/component: adapter-resources
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+data:
+  namespace.yaml: |
+    {{- .Files.Get "adapter-task-resource-namespace.yaml" | nindent 4 }}
+  pull-secret.yaml: |
+    {{- .Files.Get "adapter-task-resource-pull-secret.yaml" | nindent 4 }}
+  signing-key.yaml: |
+    {{- .Files.Get "adapter-task-resource-signing-key.yaml" | nindent 4 }}
+  certificate.yaml: |
+    {{- .Files.Get "adapter-task-resource-certificate.yaml" | nindent 4 }}
+  hostedcluster.yaml: |
+    {{- .Files.Get "adapter-task-resource-hostedcluster.yaml" | nindent 4 }}

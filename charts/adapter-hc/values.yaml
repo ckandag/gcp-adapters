@@ -9,18 +9,11 @@ hyperfleet-adapter:
 
   adapterConfig:
     create: true
-    files:
-      adapter-config.yaml: adapter-config.yaml
+    # injected via ArgoCD fileParameters
 
   adapterTaskConfig:
     create: true
-    files:
-      task-config.yaml: adapter-task-config.yaml
-      namespace.yaml: adapter-task-resource-namespace.yaml
-      pull-secret.yaml: adapter-task-resource-pull-secret.yaml
-      signing-key.yaml: adapter-task-resource-signing-key.yaml
-      certificate.yaml: adapter-task-resource-certificate.yaml
-      hostedcluster.yaml: adapter-task-resource-hostedcluster.yaml
+    # injected via ArgoCD fileParameters
 
   broker:
     create: true
@@ -60,6 +53,9 @@ hyperfleet-adapter:
     - name: kubeconfig
       mountPath: /etc/mc-kubeconfig
       readOnly: true
+    - name: adapter-resources
+      mountPath: /etc/adapter-resources
+      readOnly: true
 
   extraVolumes:
     - name: kubeconfig
@@ -68,3 +64,6 @@ hyperfleet-adapter:
         items:
           - key: kubeconfig
             path: kubeconfig
+    - name: adapter-resources
+      configMap:
+        name: adapter-hc-resources
