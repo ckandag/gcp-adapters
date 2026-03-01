@@ -9,11 +9,18 @@ hyperfleet-adapter:
 
   adapterConfig:
     create: true
-    # yaml is injected via --set-file or ArgoCD fileParameters
+    files:
+      adapter-config.yaml: adapter-config.yaml
 
   adapterTaskConfig:
     create: true
-    # yaml is injected via --set-file or ArgoCD fileParameters
+    files:
+      task-config.yaml: adapter-task-config.yaml
+      namespace.yaml: adapter-task-resource-namespace.yaml
+      pull-secret.yaml: adapter-task-resource-pull-secret.yaml
+      signing-key.yaml: adapter-task-resource-signing-key.yaml
+      certificate.yaml: adapter-task-resource-certificate.yaml
+      hostedcluster.yaml: adapter-task-resource-hostedcluster.yaml
 
   broker:
     create: true

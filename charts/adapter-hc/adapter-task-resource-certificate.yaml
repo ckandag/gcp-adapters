@@ -1,0 +1,30 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: external-api-cert
+  namespace: "clusters-{{ .clusterId }}"
+  labels:
+    hyperfleet.io/cluster-id: "{{ .clusterId }}"
+    hyperfleet.io/managed-by: "adapter-hc"
+    hyperfleet.io/resource-type: "certificate"
+spec:
+  subject:
+    organizations:
+      - "Red Hat - Hypershift"
+  usages:
+    - server auth
+    - client auth
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: RSA
+    encoding: PKCS1
+    size: 2048
+    rotationPolicy: Always
+  dnsNames:
+    - "*.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
+  secretName: external-api-cert
+  issuerRef:
+    name: public-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io

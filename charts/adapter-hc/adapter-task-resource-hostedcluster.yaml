@@ -1,0 +1,99 @@
+apiVersion: hypershift.openshift.io/v1beta1
+kind: HostedCluster
+metadata:
+  name: "{{ .clusterName }}"
+  namespace: "clusters-{{ .clusterId }}"
+  labels:
+    hyperfleet.io/cluster-id: "{{ .clusterId }}"
+    hyperfleet.io/managed-by: "adapter-hc"
+    hyperfleet.io/resource-type: "hosted-cluster"
+  annotations:
+    hypershift.openshift.io/pod-security-admission-label-override: baseline
+    hypershift.openshift.io/skip-kas-conflict-san-validation: "true"
+    hypershift.openshift.io/control-plane-operator-image: "quay.io/cveiga/hypershift:latest"
+spec:
+  release:
+    image: "{{ .releaseImage }}"
+
+  controllerAvailabilityPolicy: SingleReplica
+
+  platform:
+    type: GCP
+    gcp:
+      project: "{{ .gcpProjectID }}"
+      region: "{{ .gcpRegion }}"
+      networkConfig:
+        network:
+          name: "{{ .gcpNetwork }}"
+        privateServiceConnectSubnet:
+          name: "{{ .gcpSubnet }}"
+      endpointAccess: "{{ .gcpEndpointAccess }}"
+      workloadIdentity:
+        projectNumber: "{{ .wifProjectNumber }}"
+        poolID: "{{ .wifPoolID }}"
+        providerID: "{{ .wifProviderID }}"
+        serviceAccountsEmails:
+          nodePool: "{{ .nodePoolEmail }}"
+          controlPlane: "{{ .controlPlaneEmail }}"
+          cloudController: "{{ .cloudControllerEmail }}"
+          storage: "{{ .storageEmail }}"
+
+  pullSecret:
+    name: pull-secret
+
+  networking:
+    clusterNetwork:
+      - cidr: 10.132.0.0/14
+    serviceNetwork:
+      - cidr: 172.31.0.0/16
+    networkType: OVNKubernetes
+
+  services:
+    - service: APIServer
+      servicePublishingStrategy:
+        type: Route
+        route:
+          hostname: "api.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
+    - service: OAuthServer
+      servicePublishingStrategy:
+        type: Route
+        route:
+          hostname: "oauth.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
+    - service: Konnectivity
+      servicePublishingStrategy:
+        type: Route
+    - service: Ignition
+      servicePublishingStrategy:
+        type: Route
+
+  infraID: "{{ .infraID }}"
+  clusterID: "{{ .hcClusterID }}"
+
+  dns:
+    baseDomain: "in.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
+    baseDomainPrefix: ""
+
+  issuerURL: "{{ .issuerURL }}"
+
+  serviceAccountSigningKey:
+    name: "{{ .clusterName }}-signing-key"
+
+  capabilities:
+    disabled:
+      - ImageRegistry
+
+  configuration:
+    authentication:
+      type: OIDC
+      oidcProviders:
+      - name: google
+        issuer:
+          issuerURL: https://accounts.google.com
+          audiences:
+          - 32555940559.apps.googleusercontent.com
+        claimMappings:
+          username:
+            claim: email
+          groups:
+            claim: hd
+            prefix: ""
