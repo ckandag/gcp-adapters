@@ -1,0 +1,228 @@
+# ManifestWork bundling all management-cluster resources for a HostedCluster.
+# Referenced from adapter-task-config.yaml via:
+#   manifest:
+#     ref: "/etc/adapter/manifestwork.yaml"
+#
+# All Go-template variables ({{ .foo }}) are resolved by the adapter framework
+# before the ManifestWork is sent to Maestro.
+apiVersion: work.open-cluster-management.io/v1
+kind: ManifestWork
+metadata:
+  name: "{{ .clusterId }}-adapter-hc"
+  labels:
+    hyperfleet.io/cluster-id: "{{ .clusterId }}"
+    hyperfleet.io/adapter: "adapter-hc"
+    hyperfleet.io/component: "hosted-cluster"
+    hyperfleet.io/generation: "{{ .generation }}"
+spec:
+  workload:
+    manifests:
+
+      # --- Manifest 0: Namespace ---
+      - apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: "clusters-{{ .clusterId }}"
+          labels:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+            hyperfleet.io/cluster-name: "{{ .clusterName }}"
+            hyperfleet.io/managed-by: "adapter-hc"
+            hyperfleet.io/resource-type: "namespace"
+          annotations:
+            hyperfleet.io/generation: "{{ .generation }}"
+
+      # --- Manifest 1: Pull Secret (ExternalSecret) ---
+      - apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata:
+          name: pull-secret
+          namespace: "clusters-{{ .clusterId }}"
+          labels:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+            hyperfleet.io/managed-by: "adapter-hc"
+            hyperfleet.io/resource-type: "pull-secret"
+        spec:
+          refreshInterval: 1h
+          secretStoreRef:
+            name: "{{ .pullSecretStoreName }}"
+            kind: ClusterSecretStore
+          target:
+            name: pull-secret
+            creationPolicy: Owner
+            template:
+              type: kubernetes.io/dockerconfigjson
+          data:
+            - secretKey: .dockerconfigjson
+              remoteRef:
+                key: "{{ .pullSecretGcpKey }}"
+
+      # --- Manifest 2: Signing Key Secret ---
+      - apiVersion: v1
+        kind: Secret
+        metadata:
+          name: "{{ .clusterName }}-signing-key"
+          namespace: "clusters-{{ .clusterId }}"
+          labels:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+            hyperfleet.io/managed-by: "adapter-hc"
+            hyperfleet.io/resource-type: "signing-key"
+        type: Opaque
+        data:
+          key: "{{ .serviceAccountSigningKey }}"
+
+      # --- Manifest 3: API Server Certificate ---
+      - apiVersion: cert-manager.io/v1
+        kind: Certificate
+        metadata:
+          name: external-api-cert
+          namespace: "clusters-{{ .clusterId }}"
+          labels:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+            hyperfleet.io/managed-by: "adapter-hc"
+            hyperfleet.io/resource-type: "certificate"
+        spec:
+          subject:
+            organizations:
+              - "Red Hat - Hypershift"
+          usages:
+            - server auth
+            - client auth
+          duration: 2160h
+          renewBefore: 720h
+          privateKey:
+            algorithm: RSA
+            encoding: PKCS1
+            size: 2048
+            rotationPolicy: Always
+          dnsNames:
+            - "*.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
+          secretName: external-api-cert
+          issuerRef:
+            name: public-issuer
+            kind: ClusterIssuer
+            group: cert-manager.io
+
+      # --- Manifest 4: HostedCluster ---
+      - apiVersion: hypershift.openshift.io/v1beta1
+        kind: HostedCluster
+        metadata:
+          name: "{{ .clusterName }}"
+          namespace: "clusters-{{ .clusterId }}"
+          labels:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+            hyperfleet.io/managed-by: "adapter-hc"
+            hyperfleet.io/resource-type: "hosted-cluster"
+          annotations:
+            hypershift.openshift.io/pod-security-admission-label-override: baseline
+            hypershift.openshift.io/skip-kas-conflict-san-validation: "true"
+            hypershift.openshift.io/control-plane-operator-image: "quay.io/cveiga/hypershift:latest"
+        spec:
+          release:
+            image: "{{ .releaseImage }}"
+          controllerAvailabilityPolicy: SingleReplica
+          platform:
+            type: GCP
+            gcp:
+              project: "{{ .gcpProjectID }}"
+              region: "{{ .gcpRegion }}"
+              networkConfig:
+                network:
+                  name: "{{ .gcpNetwork }}"
+                privateServiceConnectSubnet:
+                  name: "{{ .gcpSubnet }}"
+              endpointAccess: "{{ .gcpEndpointAccess }}"
+              workloadIdentity:
+                projectNumber: "{{ .wifProjectNumber }}"
+                poolID: "{{ .wifPoolID }}"
+                providerID: "{{ .wifProviderID }}"
+                serviceAccountsEmails:
+                  nodePool: "{{ .nodePoolEmail }}"
+                  controlPlane: "{{ .controlPlaneEmail }}"
+                  cloudController: "{{ .cloudControllerEmail }}"
+                  storage: "{{ .storageEmail }}"
+          pullSecret:
+            name: pull-secret
+          networking:
+            clusterNetwork:
+              - cidr: 10.132.0.0/14
+            serviceNetwork:
+              - cidr: 172.31.0.0/16
+            networkType: OVNKubernetes
+          services:
+            - service: APIServer
+              servicePublishingStrategy:
+                type: Route
+                route:
+                  hostname: "api.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
+            - service: OAuthServer
+              servicePublishingStrategy:
+                type: Route
+                route:
+                  hostname: "oauth.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
+            - service: Konnectivity
+              servicePublishingStrategy:
+                type: Route
+            - service: Ignition
+              servicePublishingStrategy:
+                type: Route
+          infraID: "{{ .infraID }}"
+          clusterID: "{{ .hcClusterID }}"
+          dns:
+            baseDomain: "in.{{ .clusterName }}-{{ .slug }}.{{ .baseDomain }}"
+            baseDomainPrefix: ""
+          issuerURL: "{{ .issuerURL }}"
+          serviceAccountSigningKey:
+            name: "{{ .clusterName }}-signing-key"
+          capabilities:
+            disabled:
+              - ImageRegistry
+          configuration:
+            authentication:
+              type: OIDC
+              oidcProviders:
+              - name: google
+                issuer:
+                  issuerURL: https://accounts.google.com
+                  audiences:
+                  - 32555940559.apps.googleusercontent.com
+                claimMappings:
+                  username:
+                    claim: email
+                  groups:
+                    claim: hd
+                    prefix: ""
+
+  deleteOption:
+    propagationPolicy: "Foreground"
+
+  manifestConfigs:
+    - resourceIdentifier:
+        group: ""
+        resource: "namespaces"
+        name: "clusters-{{ .clusterId }}"
+      updateStrategy:
+        type: "ServerSideApply"
+      feedbackRules:
+        - type: "JSONPaths"
+          jsonPaths:
+            - name: "phase"
+              path: ".status.phase"
+
+    - resourceIdentifier:
+        group: "hypershift.openshift.io"
+        resource: "hostedclusters"
+        namespace: "clusters-{{ .clusterId }}"
+        name: "{{ .clusterName }}"
+      updateStrategy:
+        type: "ServerSideApply"
+      feedbackRules:
+        - type: "JSONPaths"
+          jsonPaths:
+            - name: "availableCondition"
+              path: ".status.conditions[?(@.type==\"Available\")].status"
+            - name: "degradedCondition"
+              path: ".status.conditions[?(@.type==\"Degraded\")].status"
+            - name: "controlPlaneEndpoint"
+              path: ".status.controlPlaneEndpoint.host"
+            - name: "version"
+              path: ".status.version.history[0].version"

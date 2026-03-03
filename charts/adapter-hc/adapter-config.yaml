@@ -1,11 +1,12 @@
 # HyperFleet Adapter - HostedCluster deployment configuration
-# This adapter creates HostedCluster and supporting resources on the management cluster.
+# This adapter creates HostedCluster and supporting resources on the management cluster
+# via Maestro (ManifestWork over GCP Pub/Sub). No kubeconfig or direct cluster access needed.
 apiVersion: hyperfleet.redhat.com/v1alpha1
 kind: AdapterConfig
 metadata:
   name: adapter-hc
   labels:
-    hyperfleet.io/adapter-type: kubernetes
+    hyperfleet.io/adapter-type: maestro
     hyperfleet.io/component: adapter
 spec:
   adapter:
@@ -23,7 +24,12 @@ spec:
       retryAttempts: 3
       retryBackoff: exponential
 
-    kubernetes:
-      apiVersion: "v1"
-      # Remote kubeconfig for management cluster, mounted from mc-cluster-secret
-      kubeConfigPath: /etc/mc-kubeconfig/kubeconfig
+    maestro:
+      # Maestro Server gRPC endpoint — in-cluster, same namespace (hyperfleet)
+      grpcServerAddress: "maestro-grpc.hyperfleet.svc.cluster.local:8090"
+      # Maestro Server HTTP endpoint — for REST API operations
+      httpServerAddress: "http://maestro.hyperfleet.svc.cluster.local:8000"
+      # Source identifier for CloudEvents routing — must be unique per adapter
+      sourceId: "hyperfleet-adapter-hc"
+      clientId: "hyperfleet-adapter-hc-client"
+      insecure: true
