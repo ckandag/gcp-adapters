@@ -13,6 +13,7 @@ metadata:
     hyperfleet.io/cluster-id: "{{ .clusterId }}"
     hyperfleet.io/adapter: "adapter-hc"
     hyperfleet.io/component: "hosted-cluster"
+  annotations:
     hyperfleet.io/generation: "{{ .generation }}"
 spec:
   workload:
