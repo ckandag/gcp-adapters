@@ -115,7 +115,7 @@ spec:
         # registered with on the MC cluster (= MC project_id).
         # Read directly from target_project_id which is already in the cluster payload.
         - name: "targetCluster"
-          expression: "target_project_id"
+          field: "target_project_id"
           description: "Maestro consumerName of the target management cluster"
 
       conditions:
