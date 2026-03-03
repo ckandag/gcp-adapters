@@ -113,9 +113,10 @@ spec:
 
         # Target MC consumer name — matches the consumerName the Maestro Agent
         # registered with on the MC cluster (= MC project_id).
-        # Read directly from target_project_id which is already in the cluster payload.
+        # Derived from spec.platform.gcp.projectID since target_project_id
+        # is not returned by the GET /clusters API.
         - name: "targetCluster"
-          field: "target_project_id"
+          expression: "spec.platform.gcp.projectID"
           description: "Maestro consumerName of the target management cluster"
 
       conditions:
