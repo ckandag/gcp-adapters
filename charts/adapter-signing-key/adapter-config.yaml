@@ -1,0 +1,29 @@
+apiVersion: hyperfleet.redhat.com/v1alpha1
+kind: AdapterConfig
+metadata:
+  name: adapter-signing-key
+  labels:
+    hyperfleet.io/adapter-type: maestro
+    hyperfleet.io/component: adapter
+spec:
+  adapter:
+    version: "0.1.0"
+
+  debugConfig: true
+  log:
+    level: debug
+
+  clients:
+    hyperfleetApi:
+      baseUrl: http://hyperfleet-api:8000
+      version: v1
+      timeout: 10s
+      retryAttempts: 3
+      retryBackoff: exponential
+
+    maestro:
+      grpcServerAddress: "maestro-grpc.hyperfleet.svc.cluster.local:8090"
+      httpServerAddress: "http://maestro.hyperfleet.svc.cluster.local:8000"
+      sourceId: "hyperfleet-adapter-signing-key"
+      clientId: "hyperfleet-adapter-signing-key-client"
+      insecure: true

@@ -1,0 +1,223 @@
+apiVersion: hyperfleet.redhat.com/v1alpha1
+kind: AdapterTaskConfig
+metadata:
+  name: adapter-signing-key
+  labels:
+    hyperfleet.io/adapter-type: maestro
+    hyperfleet.io/component: adapter
+spec:
+  # ============================================================================
+  # Phase 1: Parameter extraction
+  # ============================================================================
+  params:
+    - name: "clusterId"
+      source: "event.id"
+      type: "string"
+      required: true
+
+    - name: "generation"
+      source: "event.generation"
+      type: "int"
+      required: true
+
+    - name: "keygenImage"
+      source: "env.KEYGEN_IMAGE"
+      type: "string"
+      default: "google/cloud-sdk:slim"
+
+    - name: "keygenGcpSA"
+      source: "env.KEYGEN_GCP_SA"
+      type: "string"
+      required: true
+      description: "GCP SA email for keygen Job WIF (needs GCS write access to issuer bucket)"
+
+  # ============================================================================
+  # Phase 2: Preconditions - fetch cluster details from HyperFleet API
+  # ============================================================================
+  preconditions:
+    - name: "clusterDetails"
+      apiCall:
+        method: "GET"
+        url: "/clusters/{{ .clusterId }}"
+        timeout: 10s
+        retryAttempts: 3
+        retryBackoff: "exponential"
+      capture:
+        - name: "clusterName"
+          field: "name"
+        - name: "generation"
+          field: "generation"
+
+        - name: "infraID"
+          expression: "spec.infraID"
+        - name: "issuerURL"
+          expression: "spec.?issuerURL.orValue('')"
+
+        # GCP platform fields
+        - name: "gcpProjectID"
+          expression: "spec.platform.gcp.projectID"
+
+        # Target MC consumer name (= MC project_id)
+        - name: "targetCluster"
+          expression: "spec.platform.gcp.projectID"
+          description: "Maestro consumerName of the target management cluster"
+
+        # Ready condition check
+        - name: "readyConditionStatus"
+          expression: |
+            status.conditions.filter(c, c.type == "Ready").size() > 0
+              ? status.conditions.filter(c, c.type == "Ready")[0].status
+              : "False"
+
+      conditions:
+        - field: "readyConditionStatus"
+          operator: "equals"
+          value: "False"
+
+    - name: "validationCheck"
+      expression: |
+        readyConditionStatus == "False"
+
+  # ============================================================================
+  # Phase 3: Resources - deliver keygen Job via Maestro ManifestWork to MC
+  #
+  # ManifestWork contains:
+  #   - Namespace (clusters-{clusterId})
+  #   - ServiceAccount (keygen-sa) with WIF annotation
+  #   - Role (create/get secrets in namespace)
+  #   - RoleBinding
+  #   - Job (keygen-{clusterId}) that generates RSA keypair,
+  #     creates K8s Secret, and pushes JWKS to GCS issuer bucket
+  # ============================================================================
+  resources:
+    - name: "signingKeyBundle"
+      transport:
+        client: "maestro"
+        maestro:
+          targetCluster: "{{ .targetCluster }}"
+
+      manifest:
+        ref: "/etc/adapter/manifestwork.yaml"
+
+      discovery:
+        byName: "{{ .clusterId }}-adapter-signing-key"
+
+      nestedDiscoveries:
+        - name: "clusterNamespace"
+          discovery:
+            byName: "clusters-{{ .clusterId }}"
+        - name: "keygenJob"
+          discovery:
+            byName: "keygen-{{ .clusterId }}"
+
+  # ============================================================================
+  # Phase 4: Status reporting
+  # ============================================================================
+  post:
+    payloads:
+      - name: "statusPayload"
+        build:
+          adapter: "{{ .metadata.name }}"
+          conditions:
+            # Applied: ManifestWork accepted by Maestro and applied by agent
+            - type: "Applied"
+              status:
+                expression: |
+                  has(resources.signingKeyBundle) && has(resources.signingKeyBundle.status)
+                  && has(resources.signingKeyBundle.status.conditions)
+                  && resources.signingKeyBundle.status.conditions.filter(c, has(c.type) && c.type == "Applied").size() > 0
+                  ? resources.signingKeyBundle.status.conditions.filter(c, c.type == "Applied")[0].status
+                  : "False"
+              reason:
+                expression: |
+                  has(resources.signingKeyBundle) && has(resources.signingKeyBundle.status)
+                  && has(resources.signingKeyBundle.status.conditions)
+                  && resources.signingKeyBundle.status.conditions.filter(c, has(c.type) && c.type == "Applied").size() > 0
+                  ? resources.signingKeyBundle.status.conditions.filter(c, c.type == "Applied")[0].reason
+                  : "ManifestWorkNotApplied"
+              message:
+                expression: |
+                  has(resources.signingKeyBundle) && has(resources.signingKeyBundle.status)
+                  && has(resources.signingKeyBundle.status.conditions)
+                  && resources.signingKeyBundle.status.conditions.filter(c, has(c.type) && c.type == "Applied").size() > 0
+                  ? resources.signingKeyBundle.status.conditions.filter(c, c.type == "Applied")[0].message
+                  : "ManifestWork not yet applied by Maestro agent"
+
+            # Available: keygen Job completed successfully
+            - type: "Available"
+              status:
+                expression: |
+                  has(resources.keygenJob) && has(resources.keygenJob.statusFeedback)
+                  && has(resources.keygenJob.statusFeedback.values)
+                  && resources.keygenJob.statusFeedback.values.exists(v, has(v.name) && v.name == "succeeded")
+                  ? (resources.keygenJob.statusFeedback.values.filter(v, v.name == "succeeded")[0].fieldValue.integer > 0
+                    ? "True" : "False")
+                  : "False"
+              reason:
+                expression: |
+                  has(resources.keygenJob) && has(resources.keygenJob.statusFeedback)
+                  && has(resources.keygenJob.statusFeedback.values)
+                  && resources.keygenJob.statusFeedback.values.exists(v, has(v.name) && v.name == "succeeded")
+                  ? (resources.keygenJob.statusFeedback.values.filter(v, v.name == "succeeded")[0].fieldValue.integer > 0
+                    ? "KeygenCompleted" : "KeygenPending")
+                  : "KeygenNotStarted"
+              message:
+                expression: |
+                  has(resources.keygenJob) && has(resources.keygenJob.statusFeedback)
+                  && has(resources.keygenJob.statusFeedback.values)
+                  && resources.keygenJob.statusFeedback.values.exists(v, has(v.name) && v.name == "succeeded")
+                  ? (resources.keygenJob.statusFeedback.values.filter(v, v.name == "succeeded")[0].fieldValue.integer > 0
+                    ? "Signing key generated and JWKS published"
+                    : "Keygen job has not completed yet")
+                  : "Keygen job status not yet available"
+
+            # Health: keygen Job not failed
+            - type: "Health"
+              status:
+                expression: |
+                  has(resources.keygenJob) && has(resources.keygenJob.statusFeedback)
+                  && has(resources.keygenJob.statusFeedback.values)
+                  && resources.keygenJob.statusFeedback.values.exists(v, has(v.name) && v.name == "failed")
+                  ? (resources.keygenJob.statusFeedback.values.filter(v, v.name == "failed")[0].fieldValue.integer > 0
+                    ? "False" : "True")
+                  : "True"
+              reason:
+                expression: |
+                  has(resources.keygenJob) && has(resources.keygenJob.statusFeedback)
+                  && has(resources.keygenJob.statusFeedback.values)
+                  && resources.keygenJob.statusFeedback.values.exists(v, has(v.name) && v.name == "failed")
+                  ? (resources.keygenJob.statusFeedback.values.filter(v, v.name == "failed")[0].fieldValue.integer > 0
+                    ? "KeygenFailed" : "KeygenHealthy")
+                  : "KeygenHealthy"
+              message:
+                expression: |
+                  has(resources.keygenJob) && has(resources.keygenJob.statusFeedback)
+                  && has(resources.keygenJob.statusFeedback.values)
+                  && resources.keygenJob.statusFeedback.values.exists(v, has(v.name) && v.name == "failed")
+                  ? (resources.keygenJob.statusFeedback.values.filter(v, v.name == "failed")[0].fieldValue.integer > 0
+                    ? "Keygen job has failed pods"
+                    : "Keygen job is healthy")
+                  : "Keygen job health status not yet available"
+
+          observed_generation:
+            expression: "generation"
+          observed_time: "{{ now | date \"2006-01-02T15:04:05Z07:00\" }}"
+
+          data:
+            signingKey:
+              secretName:
+                expression: |
+                  "\"" + clusterName + "-signing-key\""
+              namespace:
+                expression: |
+                  "\"clusters-\" + clusterId"
+
+    postActions:
+      - name: "reportSigningKeyStatus"
+        apiCall:
+          method: "POST"
+          url: "/clusters/{{ .clusterId }}/statuses"
+          headers:
+            - name: "Content-Type"
+              value: "application/json"
+          body: "{{ .statusPayload }}"

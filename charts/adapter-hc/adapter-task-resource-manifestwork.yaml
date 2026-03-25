@@ -148,6 +148,7 @@ spec:
                   controlPlane: "{{ .controlPlaneEmail }}"
                   cloudController: "{{ .cloudControllerEmail }}"
                   storage: "{{ .storageEmail }}"
+                  imageRegistry: "{{ .imageRegistryEmail }}"
           pullSecret:
             name: pull-secret
           networking:

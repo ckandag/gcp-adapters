@@ -1,5 +1,3 @@
-# Default values for adapter-hc (HostedCluster adapter)
-
 hyperfleet-adapter:
   image:
     registry: quay.io/openshift-hyperfleet
@@ -9,39 +7,35 @@ hyperfleet-adapter:
 
   adapterConfig:
     create: true
-    # injected via ArgoCD fileParameters
 
   adapterTaskConfig:
     create: false
-    configMapName: adapter-hc-resources
+    configMapName: adapter-signing-key-resources
 
   broker:
     create: true
     googlepubsub:
       projectId: ""
-      subscriptionId: hyperfleet-cluster-events-adapter-hc
+      subscriptionId: hyperfleet-cluster-events-adapter-signing-key
       topic: hyperfleet-cluster-events
       createTopicIfMissing: false
       createSubscriptionIfMissing: false
 
   serviceAccount:
     create: true
-    name: hyperfleet-adapter-hc
-    annotations: {}
+    name: hyperfleet-adapter-signing-key
+    annotations:
+      iam.gke.io/gcp-service-account: hyperfleet-adapter-hc@dev-reg-us-c1-ckandagcd56.iam.gserviceaccount.com
 
   env:
     - name: NAMESPACE
       valueFrom:
         fieldRef:
           fieldPath: metadata.namespace
-    - name: HC_BASE_DOMAIN
-      value: "us-central1-ckandagcd56-1.dev.gcp-hcp.devshift.net"
-    - name: HC_RELEASE_IMAGE
-      value: "quay.io/openshift-release-dev/ocp-release:4.20.0-x86_64"
-    - name: PULL_SECRET_STORE_NAME
-      value: "global-gcp-secret-manager"
-    - name: PULL_SECRET_GCP_KEY
-      value: "openshift-pull-secret"
+    - name: KEYGEN_IMAGE
+      value: "google/cloud-sdk:slim"
+    - name: KEYGEN_GCP_SA
+      value: ""
 
   rbac:
     resources:

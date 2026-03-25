@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adapter-signing-key-resources
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: adapter-signing-key
+    app.kubernetes.io/component: adapter-task-config
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+data:
+  task-config.yaml: |
+    {{- .Files.Get "adapter-task-config.yaml" | nindent 4 }}
+  manifestwork.yaml: |
+    {{- .Files.Get "adapter-task-resource-manifestwork.yaml" | nindent 4 }}

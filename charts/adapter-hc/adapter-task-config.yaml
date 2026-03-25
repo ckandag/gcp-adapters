@@ -96,6 +96,8 @@ spec:
           expression: "spec.platform.gcp.workloadIdentity.serviceAccountsRef.cloudControllerEmail"
         - name: "storageEmail"
           expression: "spec.platform.gcp.workloadIdentity.serviceAccountsRef.storageEmail"
+        - name: "imageRegistryEmail"
+          expression: "spec.platform.gcp.workloadIdentity.serviceAccountsRef.imageRegistryEmail"
 
         # RFC4122 UUID for HostedCluster spec.clusterID
         - name: "hcClusterID"
