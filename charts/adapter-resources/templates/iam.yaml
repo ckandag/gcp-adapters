@@ -1,0 +1,98 @@
+{{- $wifPrefix := printf "serviceAccount:%s.svc.id.goog[%s/" .Values.gcp.project .Values.namespace -}}
+{{- $gsaSuffix := printf "@%s.iam.gserviceaccount.com" .Values.gcp.project -}}
+
+{{- range .Values.adapters }}
+{{- $adapter := . }}
+{{- $gsaMember := printf "serviceAccount:%s%s" .name $gsaSuffix }}
+
+# ============================================================================
+# {{ .name }} — Workload Identity binding
+# Allows KSA {{ .kubernetesServiceAccount }} to impersonate GSA {{ .name }}
+# ============================================================================
+---
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: {{ .name }}-wif
+  annotations:
+    cnrm.cloud.google.com/project-id: {{ $.Values.gcp.project | quote }}
+spec:
+  member: {{ $wifPrefix }}{{ .kubernetesServiceAccount }}]
+  role: roles/iam.workloadIdentityUser
+  resourceRef:
+    apiVersion: iam.cnrm.cloud.google.com/v1beta1
+    kind: IAMServiceAccount
+    name: {{ .name }}
+
+# ============================================================================
+# {{ .name }} — Pub/Sub IAM bindings
+# Granted to the GSA (not KSA WIF principal) because after WIF impersonation
+# the GSA identity is what actually calls the Pub/Sub API.
+# ============================================================================
+---
+# Pub/Sub subscriber (subscription-level)
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: {{ .name }}-pubsub-subscriber
+  annotations:
+    cnrm.cloud.google.com/project-id: {{ $.Values.gcp.project | quote }}
+spec:
+  member: {{ $gsaMember }}
+  role: roles/pubsub.subscriber
+  resourceRef:
+    apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+    kind: PubSubSubscription
+    name: {{ .pubsub.subscriptionName }}
+---
+# Pub/Sub viewer (subscription-level, required for subscription.get)
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: {{ .name }}-pubsub-viewer
+  annotations:
+    cnrm.cloud.google.com/project-id: {{ $.Values.gcp.project | quote }}
+spec:
+  member: {{ $gsaMember }}
+  role: roles/pubsub.viewer
+  resourceRef:
+    apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+    kind: PubSubSubscription
+    name: {{ .pubsub.subscriptionName }}
+---
+# Pub/Sub viewer (topic-level, required for topic.get during subscription init)
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: {{ .name }}-pubsub-topic-viewer
+  annotations:
+    cnrm.cloud.google.com/project-id: {{ $.Values.gcp.project | quote }}
+spec:
+  member: {{ $gsaMember }}
+  role: roles/pubsub.viewer
+  resourceRef:
+    apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+    kind: PubSubTopic
+    name: {{ $.Values.pubsub.topic }}
+
+# ============================================================================
+# {{ .name }} — Extra project-level IAM roles
+# ============================================================================
+{{- range $adapter.extraRoles }}
+---
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: {{ $adapter.name }}-{{ .role | replace "/" "-" | replace "roles-" "" }}
+  annotations:
+    cnrm.cloud.google.com/project-id: {{ $.Values.gcp.project | quote }}
+spec:
+  member: {{ $gsaMember }}
+  role: {{ .role }}
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: projects/{{ $.Values.gcp.project }}
+{{- end }}
+
+{{- end }}

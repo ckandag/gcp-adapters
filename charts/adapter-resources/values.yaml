@@ -1,0 +1,41 @@
+gcp:
+  project: ""
+  region: "us-central1"
+
+namespace: "hyperfleet"
+
+pubsub:
+  topic: "hyperfleet-cluster-events"
+
+# Each adapter entry provisions:
+#   - GCP Service Account (IAMServiceAccount)
+#   - WIF binding (IAMPolicyMember: roles/iam.workloadIdentityUser)
+#   - Pub/Sub subscription (PubSubSubscription)
+#   - Pub/Sub IAM (subscriber + viewer on subscription, viewer on topic)
+#   - Any extra project-level IAM roles (e.g. secretmanager.viewer)
+#
+# Add a new block under `adapters` for each adapter that needs GCP resources.
+adapters:
+  - name: placement-adapter
+    kubernetesServiceAccount: hyperfleet-adapter-placement-job
+    serviceAccount:
+      displayName: "Placement Adapter"
+      description: "GSA for HyperFleet placement adapter - Pub/Sub subscription and Secret Manager listing"
+    pubsub:
+      subscriptionName: hyperfleet-cluster-events-adapter-placement-job
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: "604800s"
+    extraRoles:
+      - role: roles/secretmanager.viewer
+        scope: project
+
+  - name: hc-adapter
+    kubernetesServiceAccount: hyperfleet-adapter-hc
+    serviceAccount:
+      displayName: "HostedCluster Adapter"
+      description: "GSA for HyperFleet HC adapter - Pub/Sub subscription for cluster events"
+    pubsub:
+      subscriptionName: hyperfleet-cluster-events-adapter-hc
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: "604800s"
+    extraRoles: []

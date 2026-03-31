@@ -1,0 +1,51 @@
+hyperfleet-adapter:
+  image:
+    registry: quay.io/openshift-hyperfleet
+    repository: hyperfleet-adapter
+    pullPolicy: Always
+    tag: v0.1.0
+
+  adapterConfig:
+    create: true
+    # injected via ArgoCD fileParameters or --set-file at install time
+
+  adapterTaskConfig:
+    create: false
+    configMapName: adapter-placement-job-resources
+
+  broker:
+    create: true
+    googlepubsub:
+      projectId: ""
+      subscriptionId: hyperfleet-cluster-events-adapter-placement-job
+      topic: hyperfleet-cluster-events
+      createTopicIfMissing: false
+      createSubscriptionIfMissing: false
+
+  serviceAccount:
+    create: true
+    name: hyperfleet-adapter-placement-job
+    annotations: {}
+
+  env:
+    - name: NAMESPACE
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.namespace
+    - name: SERVICE_ACCOUNT
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.serviceAccountName
+    - name: GCP_PROJECT_ID
+      value: ""
+    - name: MAESTRO_URL
+      value: "http://maestro.hyperfleet.svc.cluster.local:8000"
+    - name: PLACEMENT_IMAGE
+      value: "google/cloud-sdk:slim"
+
+  rbac:
+    resources:
+      - configmaps
+      - jobs
+      - jobs/status
+      - pods

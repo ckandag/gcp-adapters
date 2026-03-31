@@ -1,0 +1,150 @@
+# Placement Job - cross-checks Secret Manager and Maestro consumers
+# to select an eligible management cluster.
+#
+# Single container that runs the selection logic and patches the
+# Job's .status.conditions directly via the Kubernetes API.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: "placement-{{ .clusterId }}"
+  namespace: "{{ .namespace }}"
+  labels:
+    hyperfleet.io/cluster-id: "{{ .clusterId }}"
+    hyperfleet.io/resource-type: "job"
+    hyperfleet.io/managed-by: "adapter-placement-job"
+  annotations:
+    hyperfleet.io/generation: "{{ .generation }}"
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 120
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: placement-job
+        job-name: "placement-{{ .clusterId }}"
+        hyperfleet.io/cluster-id: "{{ .clusterId }}"
+    spec:
+      serviceAccountName: "{{ .serviceAccountName }}"
+      restartPolicy: OnFailure
+
+      containers:
+        - name: placement
+          image: "{{ .placementImage }}"
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "=== Placement Job ==="
+              echo "Cluster:     ${CLUSTER_ID}"
+              echo "GCP Project: ${GCP_PROJECT_ID}"
+              echo "Maestro URL: ${MAESTRO_URL}"
+
+              TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+              CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+              API=https://kubernetes.default.svc
+
+              # Patch the Job's .status.conditions via the Kubernetes API.
+              patch_job_condition() {
+                local cond_status="$1" reason="$2" message="$3"
+                local payload
+                payload=$(python3 -c "
+              import json, datetime
+              print(json.dumps({'status': {'conditions': [{
+                'type': 'Available',
+                'status': '${cond_status}',
+                'reason': '${reason}',
+                'message': '${message}',
+                'lastTransitionTime': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+              }]}}))
+              ")
+                curl -sf --cacert "$CA" -H "Authorization: Bearer $TOKEN" \
+                  -H "Content-Type: application/merge-patch+json" \
+                  -X PATCH \
+                  "${API}/apis/batch/v1/namespaces/${NAMESPACE}/jobs/placement-${CLUSTER_ID}/status" \
+                  -d "${payload}" > /dev/null
+              }
+
+              # ── Step 1: Secret Manager ─────────────────────────────────
+              echo "Querying Secret Manager for MC secrets..."
+              _sm_err=$(mktemp)
+              SM_MCS=$(gcloud secrets list \
+                --project="${GCP_PROJECT_ID}" \
+                --filter='labels.maestro-consumer-name:*' \
+                --format='value(labels.maestro-consumer-name)' 2>"${_sm_err}") || true
+
+              if [ -z "${SM_MCS}" ]; then
+                echo "ERROR: No MC secrets found in Secret Manager"
+                cat "${_sm_err}" >&2
+                rm -f "${_sm_err}"
+                patch_job_condition "False" "NoMCSecrets" \
+                  "No management cluster secrets found in Secret Manager for project ${GCP_PROJECT_ID}"
+                exit 1
+              fi
+              rm -f "${_sm_err}"
+              echo "Secret Manager MCs: $(echo ${SM_MCS} | tr '\n' ', ')"
+
+              # ── Step 2: Maestro consumers ──────────────────────────────
+              echo "Querying Maestro consumers..."
+              MAESTRO_RESPONSE=$(curl -sf "${MAESTRO_URL}/api/maestro/v1/consumers?size=100" 2>/dev/null) || true
+
+              if [ -z "${MAESTRO_RESPONSE}" ]; then
+                patch_job_condition "False" "MaestroUnavailable" \
+                  "Failed to query Maestro API at ${MAESTRO_URL}"
+                exit 1
+              fi
+
+              MAESTRO_MCS=$(echo "${MAESTRO_RESPONSE}" | python3 -c "
+              import sys, json
+              data = json.load(sys.stdin)
+              for c in data.get('items', []):
+                  print(c['name'])
+              " 2>/dev/null) || true
+
+              if [ -z "${MAESTRO_MCS}" ]; then
+                patch_job_condition "False" "NoMaestroConsumers" \
+                  "No consumers registered in Maestro"
+                exit 1
+              fi
+              echo "Maestro MCs: $(echo ${MAESTRO_MCS} | tr '\n' ', ')"
+
+              # ── Step 3: Cross-check ────────────────────────────────────
+              echo "Cross-checking Secret Manager and Maestro..."
+              ELIGIBLE=$(comm -12 \
+                <(echo "${SM_MCS}" | sort) \
+                <(echo "${MAESTRO_MCS}" | sort))
+
+              if [ -z "${ELIGIBLE}" ]; then
+                patch_job_condition "False" "NoEligibleMC" \
+                  "No management clusters present in both Secret Manager and Maestro"
+                exit 1
+              fi
+              echo "Eligible MCs: $(echo ${ELIGIBLE} | tr '\n' ', ')"
+
+              # ── Step 4: Select MC (MVP: first eligible) ────────────────
+              # TODO: implement least-loaded selection by querying HyperFleet API
+              # for cluster counts per MC.
+              SELECTED=$(echo "${ELIGIBLE}" | head -1)
+              echo "Selected MC: ${SELECTED}"
+
+              # ── Step 5: Patch Job condition with result ────────────────
+              patch_job_condition "True" "PlacementDecided" "${SELECTED}"
+              echo "=== Placement Complete: ${SELECTED} ==="
+          env:
+            - name: CLUSTER_ID
+              value: "{{ .clusterId }}"
+            - name: NAMESPACE
+              value: "{{ .namespace }}"
+            - name: GCP_PROJECT_ID
+              value: "{{ .gcpProjectId }}"
+            - name: MAESTRO_URL
+              value: "{{ .maestroUrl }}"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

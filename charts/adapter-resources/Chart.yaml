@@ -1,0 +1,6 @@
+apiVersion: v2
+name: adapter-resources
+description: GCP cloud resources for HyperFleet adapters using Config Connector (IAM, Pub/Sub, WIF)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

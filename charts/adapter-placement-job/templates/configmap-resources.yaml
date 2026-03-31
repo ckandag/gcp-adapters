@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adapter-placement-job-resources
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: adapter-placement-job
+    app.kubernetes.io/component: adapter-task-config
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+data:
+  task-config.yaml: |
+    {{- .Files.Get "adapter-task-config.yaml" | nindent 4 }}
+  job.yaml: |
+    {{- .Files.Get "adapter-task-resource-job.yaml" | nindent 4 }}

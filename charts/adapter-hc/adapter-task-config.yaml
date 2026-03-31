@@ -113,29 +113,42 @@ spec:
         - name: "slug"
           expression: "'user'"
 
-        # Target MC consumer name — matches the consumerName the Maestro Agent
-        # registered with on the MC cluster (= MC project_id).
-        # Derived from spec.platform.gcp.projectID since target_project_id
-        # is not returned by the GET /clusters API.
-        - name: "targetCluster"
-          expression: "spec.platform.gcp.projectID"
-          description: "Maestro consumerName of the target management cluster"
-
       conditions:
         - field: "readyConditionStatus"
           operator: "equals"
           value: "False"
 
-    - name: "validationCheck"
+    # Fetch the placement decision from adapter-placement-job's status.
+    # The placement adapter writes data.managementClusterName with the
+    # Maestro consumerName of the selected MC.
+    - name: "placementStatus"
+      apiCall:
+        method: "GET"
+        url: "/clusters/{{ .clusterId }}/statuses"
+        timeout: 10s
+        retryAttempts: 3
+        retryBackoff: "exponential"
+      capture:
+        - name: "targetCluster"
+          expression: |
+            items.filter(s, s.adapter == "adapter-placement-job").size() > 0
+            && has(items.filter(s, s.adapter == "adapter-placement-job")[0].data)
+            && has(items.filter(s, s.adapter == "adapter-placement-job")[0].data.managementClusterName)
+            && items.filter(s, s.adapter == "adapter-placement-job")[0].data.managementClusterName != ""
+              ? items.filter(s, s.adapter == "adapter-placement-job")[0].data.managementClusterName
+              : ""
+
+    # Gate: only proceed if placement has been decided and cluster is not Ready.
+    - name: "placementReady"
       expression: |
-        readyConditionStatus == "False"
+        targetCluster != "" && readyConditionStatus == "False"
 
   # ============================================================================
   # Phase 3: Resources - deliver via Maestro ManifestWork to the target MC
   #
   # All 5 resources (Namespace, PullSecret, SigningKey, Certificate, HostedCluster)
   # are bundled into a single ManifestWork. Maestro routes it to the target MC
-  # identified by targetCluster (consumerName = MC project_id).
+  # identified by targetCluster (read from adapter-placement-job's status).
   # ============================================================================
   resources:
     - name: "hostedClusterBundle"

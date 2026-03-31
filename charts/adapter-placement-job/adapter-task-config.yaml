@@ -1,0 +1,210 @@
+# HyperFleet Adapter - Placement task configuration (Job-based)
+#
+# Runs a Kubernetes Job that cross-checks Secret Manager secrets
+# against Maestro registered consumers to select an eligible MC.
+# The Job patches its own .status.conditions with the placement
+# result so the adapter can discover the outcome.
+#
+# Flow:
+#   Event N (no placement yet) → Job created → report status
+#   Event N+1 (placement exists) → gate closed → ack, no-op
+apiVersion: hyperfleet.redhat.com/v1alpha1
+kind: AdapterTaskConfig
+metadata:
+  name: adapter-placement-job
+  labels:
+    hyperfleet.io/adapter-type: kubernetes
+    hyperfleet.io/component: adapter
+spec:
+  # ============================================================================
+  # Phase 1: Parameter extraction
+  # ============================================================================
+  params:
+    - name: "clusterId"
+      source: "event.id"
+      type: "string"
+      required: true
+
+    - name: "generation"
+      source: "event.generation"
+      type: "int"
+      required: true
+
+    - name: "namespace"
+      source: "env.NAMESPACE"
+      type: "string"
+      required: true
+
+    - name: "serviceAccountName"
+      source: "env.SERVICE_ACCOUNT"
+      type: "string"
+      required: true
+
+    - name: "gcpProjectId"
+      source: "env.GCP_PROJECT_ID"
+      type: "string"
+      required: true
+      description: "Regional GCP project ID for Secret Manager lookups"
+
+    - name: "maestroUrl"
+      source: "env.MAESTRO_URL"
+      type: "string"
+      default: "http://maestro.hyperfleet.svc.cluster.local:8000"
+
+    - name: "placementImage"
+      source: "env.PLACEMENT_IMAGE"
+      type: "string"
+      default: "google/cloud-sdk:slim"
+
+  # ============================================================================
+  # Phase 2: Preconditions
+  #
+  # 1. Fetch cluster from HyperFleet API
+  # 2. Check if placement already decided — gate closes, adapter acks and
+  #    does nothing (no status re-post, no Job creation)
+  # ============================================================================
+  preconditions:
+    - name: "clusterDetails"
+      apiCall:
+        method: "GET"
+        url: "/clusters/{{ .clusterId }}"
+        timeout: 10s
+        retryAttempts: 3
+        retryBackoff: "exponential"
+      capture:
+        - name: "clusterName"
+          field: "name"
+        - name: "generation"
+          field: "generation"
+
+    - name: "adapterStatuses"
+      apiCall:
+        method: "GET"
+        url: "/clusters/{{ .clusterId }}/statuses"
+        timeout: 10s
+        retryAttempts: 3
+        retryBackoff: "exponential"
+      capture:
+        - name: "existingPlacementMC"
+          expression: |
+            items.filter(s, s.adapter == "adapter-placement-job").size() > 0
+            && has(items.filter(s, s.adapter == "adapter-placement-job")[0].data)
+            && has(items.filter(s, s.adapter == "adapter-placement-job")[0].data.managementClusterName)
+              ? items.filter(s, s.adapter == "adapter-placement-job")[0].data.managementClusterName
+              : ""
+
+    # Gate: only proceed if no successful placement exists.
+    # On failure (managementClusterName empty) the gate stays open → retry.
+    # On success the gate closes → ack, no-op.
+    - name: "placementGate"
+      expression: |
+        existingPlacementMC == ""
+
+  # ============================================================================
+  # Phase 3: Resources — placement Job
+  #
+  # Single container that cross-checks SM + Maestro and patches
+  # its own .status.conditions with the placement result.
+  # ============================================================================
+  resources:
+    - name: "placementJob"
+      transport:
+        client: "kubernetes"
+      manifest:
+        ref: "/etc/adapter/job.yaml"
+      discovery:
+        bySelectors:
+          labelSelector:
+            hyperfleet.io/cluster-id: "{{ .clusterId }}"
+            hyperfleet.io/resource-type: "job"
+            hyperfleet.io/managed-by: "adapter-placement-job"
+
+  # ============================================================================
+  # Phase 4: Status reporting (TEST — no sticky logic)
+  #
+  # Naively reports based on Job state only. If post-actions run
+  # when the gate skips resources, resources.placementJob won't exist
+  # and this will overwrite the good placement with empty/Unknown values.
+  # ============================================================================
+  post:
+    payloads:
+      - name: "statusPayload"
+        build:
+          adapter: "{{ .metadata.name }}"
+          conditions:
+            - type: "Applied"
+              status:
+                expression: |
+                  has(resources.placementJob) ? "True" : "False"
+              reason:
+                expression: |
+                  has(resources.placementJob) ? "JobApplied" : "JobPending"
+              message:
+                expression: |
+                  has(resources.placementJob)
+                    ? "Placement job applied successfully"
+                    : "Placement job is pending"
+
+            - type: "Available"
+              status:
+                expression: |
+                  has(resources.placementJob)
+                    ? ( resources.?placementJob.?status.?conditions.orValue([]).exists(c, c.type == "Available")
+                        ? resources.placementJob.status.conditions.filter(c, c.type == "Available")[0].status
+                        : "Unknown")
+                    : "Unknown"
+              reason:
+                expression: |
+                  has(resources.placementJob)
+                    ? ( resources.?placementJob.?status.?conditions.orValue([]).exists(c, c.type == "Available")
+                        ? resources.placementJob.status.conditions.filter(c, c.type == "Available")[0].reason
+                        : "JobInProgress")
+                    : "JobPending"
+              message:
+                expression: |
+                  has(resources.placementJob)
+                    ? ( resources.?placementJob.?status.?conditions.orValue([]).exists(c, c.type == "Available")
+                        ? resources.placementJob.status.conditions.filter(c, c.type == "Available")[0].message
+                        : "Placement job has not completed yet")
+                    : "Placement job status not yet available"
+
+            - type: "Health"
+              status:
+                expression: |
+                  adapter.?executionStatus.orValue("") == "success"
+                    ? "True" : "False"
+              reason:
+                expression: |
+                  adapter.?executionStatus.orValue("") != "success"
+                    ? "ExecutionFailed"
+                    : "Healthy"
+              message:
+                expression: |
+                  adapter.?executionStatus.orValue("") != "success"
+                    ? "Adapter execution failed"
+                    : "Adapter execution completed successfully"
+
+          observed_generation:
+            expression: "generation"
+          observed_time: "{{ now | date \"2006-01-02T15:04:05Z07:00\" }}"
+
+          data:
+            managementClusterName:
+              expression: |
+                has(resources.placementJob)
+                  && resources.?placementJob.?status.?conditions.orValue([]).exists(c, c.type == "Available" && c.status == "True")
+                  ? resources.placementJob.status.conditions.filter(c, c.type == "Available")[0].message
+                  : ""
+            managementClusterNamespace:
+              expression: |
+                "clusters-" + clusterId
+
+    postActions:
+      - name: "reportPlacementStatus"
+        apiCall:
+          method: "POST"
+          url: "/clusters/{{ .clusterId }}/statuses"
+          headers:
+            - name: "Content-Type"
+              value: "application/json"
+          body: "{{ .statusPayload }}"
