@@ -3,7 +3,7 @@ hyperfleet-adapter:
     registry: quay.io/openshift-hyperfleet
     repository: hyperfleet-adapter
     pullPolicy: Always
-    tag: v0.1.0
+    tag: v0.1.1
 
   adapterConfig:
     create: true
@@ -15,7 +15,7 @@ hyperfleet-adapter:
   broker:
     create: true
     googlepubsub:
-      projectId: ""
+      projectId: "dev-reg-us-c1-ckandag910f"
       subscriptionId: hyperfleet-cluster-events-adapter-signing-key
       topic: hyperfleet-cluster-events
       createTopicIfMissing: false
@@ -25,7 +25,7 @@ hyperfleet-adapter:
     create: true
     name: hyperfleet-adapter-signing-key
     annotations:
-      iam.gke.io/gcp-service-account: hyperfleet-adapter-hc@dev-reg-us-c1-ckandagcd56.iam.gserviceaccount.com
+      iam.gke.io/gcp-service-account: signing-key-adapter@dev-reg-us-c1-ckandag910f.iam.gserviceaccount.com
 
   env:
     - name: NAMESPACE
@@ -35,7 +35,7 @@ hyperfleet-adapter:
     - name: KEYGEN_IMAGE
       value: "google/cloud-sdk:slim"
     - name: KEYGEN_GCP_SA
-      value: ""
+      value: "signing-key-adapter@dev-reg-us-c1-ckandag910f.iam.gserviceaccount.com"
 
   rbac:
     resources:

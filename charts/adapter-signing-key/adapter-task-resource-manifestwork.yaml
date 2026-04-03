@@ -1,6 +1,7 @@
 # ManifestWork that deploys keygen resources to the management cluster.
-# Generates an RSA signing keypair on the MC. The private key never leaves the MC.
-# The public key is published as JWKS to the GCS OIDC issuer bucket.
+# If a signing key is provided, creates only the K8s Secret (caller handles OIDC).
+# Otherwise generates an RSA keypair on the MC, creates the Secret, and publishes
+# the JWKS + OIDC discovery documents to the GCS issuer bucket.
 apiVersion: work.open-cluster-management.io/v1
 kind: ManifestWork
 metadata:
@@ -82,8 +83,10 @@ spec:
           apiGroup: rbac.authorization.k8s.io
 
       # --- Manifest 4: Keygen Job ---
-      # Generates RSA 4096-bit keypair, stores private key as K8s Secret,
-      # publishes public key as JWKS + OIDC discovery to GCS issuer bucket.
+      # If SIGNING_KEY_PEM is provided, uses the caller-supplied key and creates
+      # the K8s Secret only (caller handles OIDC/JWKS setup externally).
+      # Otherwise generates RSA 4096-bit keypair, creates the Secret, and
+      # publishes JWKS + OIDC discovery documents to the GCS issuer bucket.
       - apiVersion: batch/v1
         kind: Job
         metadata:
@@ -120,6 +123,8 @@ spec:
                       value: "{{ .clusterName }}-signing-key"
                     - name: ISSUER_URL
                       value: "{{ .issuerURL }}"
+                    - name: SIGNING_KEY_PEM
+                      value: "{{ .signingKeyPEM }}"
                   command: ["/bin/bash", "-c"]
                   args:
                     - |
@@ -130,6 +135,7 @@ spec:
                       echo "Namespace: ${NAMESPACE}"
                       echo "Secret: ${SECRET_NAME}"
                       echo "Issuer URL: ${ISSUER_URL}"
+                      echo "Mode: $([ -n "${SIGNING_KEY_PEM}" ] && echo provided || echo generate)"
 
                       TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
                       CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
@@ -141,15 +147,32 @@ spec:
                         "${API}/api/v1/namespaces/${NAMESPACE}/secrets/${SECRET_NAME}")
 
                       if [ "$HTTP_CODE" = "200" ]; then
-                        echo "Secret ${SECRET_NAME} already exists — skipping generation"
+                        echo "Secret ${SECRET_NAME} already exists — skipping"
                         exit 0
                       fi
 
-                      echo "Generating 4096-bit RSA signing keypair..."
-                      openssl genrsa -out /tmp/sa-signer.key 4096 2>/dev/null
-                      openssl rsa -in /tmp/sa-signer.key -pubout -out /tmp/sa-signer.pub 2>/dev/null
+                      # Step 1: Obtain the private key (provided or generated)
+                      if [ -n "${SIGNING_KEY_PEM}" ]; then
+                        echo "Using caller-provided signing key..."
+                        echo "${SIGNING_KEY_PEM}" | base64 -d > /tmp/sa-signer.key
 
-                      # Create K8s Secret with private key
+                        # Validate: must be a valid RSA private key in PKCS#1 format
+                        if ! head -1 /tmp/sa-signer.key | grep -q "BEGIN RSA PRIVATE KEY"; then
+                          echo "ERROR: Provided key is not in PKCS#1 format (expected BEGIN RSA PRIVATE KEY)"
+                          echo "Got: $(head -1 /tmp/sa-signer.key)"
+                          exit 1
+                        fi
+                        if ! openssl rsa -in /tmp/sa-signer.key -check -noout 2>/dev/null; then
+                          echo "ERROR: Provided key failed RSA validation"
+                          exit 1
+                        fi
+                        echo "Provided key validated successfully"
+                      else
+                        echo "Generating 4096-bit RSA signing keypair (PKCS#1 format)..."
+                        openssl genrsa 4096 2>/dev/null | openssl rsa -traditional -out /tmp/sa-signer.key 2>/dev/null
+                      fi
+
+                      # Step 2: Create K8s Secret with private key
                       KEY_B64=$(base64 -w 0 /tmp/sa-signer.key)
                       HTTP_CODE=$(curl -s -o /tmp/create-result.json -w "%{http_code}" \
                         --cacert "$CA" -H "Authorization: Bearer $TOKEN" \
@@ -165,6 +188,9 @@ spec:
                               \"hyperfleet.io/cluster-id\": \"${CLUSTER_ID}\",
                               \"hyperfleet.io/managed-by\": \"adapter-signing-key\",
                               \"hyperfleet.io/resource-type\": \"signing-key\"
+                            },
+                            \"annotations\": {
+                              \"referenced-resource.hypershift.openshift.io/${CLUSTER_NAME}\": \"true\"
                             }
                           },
                           \"type\": \"Opaque\",
@@ -178,25 +204,51 @@ spec:
                       fi
                       echo "Secret ${SECRET_NAME} created successfully"
 
-                      # Generate JWKS from public key
-                      ISSUER_BUCKET="${ISSUER_URL#https://storage.googleapis.com/}"
-                      echo "Generating JWKS for bucket: ${ISSUER_BUCKET}"
+                      # Step 3: JWKS/OIDC setup (only needed when key is generated, not when provided)
+                      # When a signing key is provided externally, the caller is responsible for
+                      # OIDC bucket creation and JWKS upload (e.g. via setup-infra.sh).
+                      if [ -z "${SIGNING_KEY_PEM}" ]; then
+                        openssl rsa -in /tmp/sa-signer.key -pubout -out /tmp/sa-signer.pub 2>/dev/null
 
-                      python3 -c "
-                      import json, base64, subprocess, os
+                        ISSUER_BUCKET="${ISSUER_URL#https://storage.googleapis.com/}"
+                        echo "Generating JWKS for bucket: ${ISSUER_BUCKET}"
 
-                      result = subprocess.run(
-                          ['openssl', 'rsa', '-pubin', '-in', '/tmp/sa-signer.pub', '-modulus', '-noout'],
+                        python3 -c "
+                      import json, base64, hashlib, subprocess, os
+
+                      text_result = subprocess.run(
+                          ['openssl', 'rsa', '-pubin', '-in', '/tmp/sa-signer.pub', '-text', '-noout'],
                           capture_output=True, text=True, check=True)
-                      mod_hex = result.stdout.strip().split('=')[1]
-                      mod_bytes = bytes.fromhex(mod_hex)
+                      lines = text_result.stdout.splitlines()
+
+                      mod_lines, in_mod = [], False
+                      for line in lines:
+                          if 'Modulus:' in line:
+                              in_mod = True; continue
+                          if 'Exponent:' in line:
+                              exp_str = line.split('(')[1].rstrip(')') if '(' in line else ''
+                              in_mod = False; continue
+                          if in_mod:
+                              mod_lines.append(line.strip().replace(':', ''))
+                      mod_bytes = bytes.fromhex(''.join(mod_lines))
+                      if mod_bytes[0:1] == b'\x00':
+                          mod_bytes = mod_bytes[1:]
+
+                      exp_int = int(exp_str, 16)
+                      exp_len = (exp_int.bit_length() + 7) // 8
+                      exp_bytes = exp_int.to_bytes(exp_len, 'big')
+
+                      der_result = subprocess.run(
+                          ['openssl', 'rsa', '-pubin', '-in', '/tmp/sa-signer.pub', '-outform', 'DER'],
+                          capture_output=True, check=True)
+                      kid = base64.urlsafe_b64encode(hashlib.sha256(der_result.stdout).digest()).rstrip(b'=').decode()
 
                       def b64url(b):
                           return base64.urlsafe_b64encode(b).rstrip(b'=').decode()
 
                       jwks = {'keys': [{
-                          'kty': 'RSA', 'use': 'sig', 'alg': 'RS256', 'kid': 'signing-key-1',
-                          'n': b64url(mod_bytes), 'e': b64url(b'\x01\x00\x01'),
+                          'kty': 'RSA', 'use': 'sig', 'alg': 'RS256', 'kid': kid,
+                          'n': b64url(mod_bytes), 'e': b64url(exp_bytes),
                       }]}
 
                       issuer = os.environ['ISSUER_URL']
@@ -214,21 +266,24 @@ spec:
                           json.dump(jwks, f, indent=2)
                       with open('/tmp/openid-configuration', 'w') as f:
                           json.dump(oidc, f, indent=2)
-                      print('JWKS and OIDC discovery documents generated')
-                      "
+                      print('JWKS and OIDC discovery documents generated (kid: ' + kid[:12] + '...)')
+                        "
 
-                      # Upload OIDC documents to GCS issuer bucket (best-effort for prototype)
-                      echo "Uploading OIDC documents to gs://${ISSUER_BUCKET}/"
-                      if gcloud storage cp /tmp/keys.json "gs://${ISSUER_BUCKET}/keys.json" 2>/dev/null && \
-                         gcloud storage cp /tmp/openid-configuration "gs://${ISSUER_BUCKET}/.well-known/openid-configuration" 2>/dev/null; then
-                        echo "OIDC documents uploaded successfully"
+                        echo "Uploading OIDC documents to gs://${ISSUER_BUCKET}/"
+                        if gcloud storage cp /tmp/keys.json "gs://${ISSUER_BUCKET}/keys.json" 2>/dev/null && \
+                           gcloud storage cp /tmp/openid-configuration "gs://${ISSUER_BUCKET}/.well-known/openid-configuration" 2>/dev/null; then
+                          echo "OIDC documents uploaded successfully"
+                        else
+                          echo "WARNING: GCS upload skipped (no bucket access). Secret was created successfully."
+                          echo "JWKS upload can be done manually or once GCS IAM is configured."
+                        fi
+
+                        rm -f /tmp/sa-signer.pub
                       else
-                        echo "WARNING: GCS upload skipped (no bucket access). Secret was created successfully."
-                        echo "JWKS upload can be done manually or once GCS IAM is configured."
+                        echo "Skipping JWKS/OIDC setup — caller provided the signing key and is responsible for OIDC configuration"
                       fi
 
-                      # Cleanup key material from disk
-                      rm -f /tmp/sa-signer.key /tmp/sa-signer.pub
+                      rm -f /tmp/sa-signer.key
 
                       echo "=== Signing Key Generation Complete ==="
                   resources:

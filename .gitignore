@@ -1,0 +1,3 @@
+scripts/*
+!scripts/*.sh
+!scripts/README.md

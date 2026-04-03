@@ -1,5 +1,5 @@
 gcp:
-  project: ""
+  project: "dev-reg-us-c1-ckandag910f"
   region: "us-central1"
 
 namespace: "hyperfleet"
@@ -36,6 +36,17 @@ adapters:
       description: "GSA for HyperFleet HC adapter - Pub/Sub subscription for cluster events"
     pubsub:
       subscriptionName: hyperfleet-cluster-events-adapter-hc
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: "604800s"
+    extraRoles: []
+
+  - name: signing-key-adapter
+    kubernetesServiceAccount: hyperfleet-adapter-signing-key
+    serviceAccount:
+      displayName: "Signing Key Adapter"
+      description: "GSA for HyperFleet signing-key adapter - Pub/Sub subscription for cluster events"
+    pubsub:
+      subscriptionName: hyperfleet-cluster-events-adapter-signing-key
       ackDeadlineSeconds: 60
       messageRetentionDuration: "604800s"
     extraRoles: []

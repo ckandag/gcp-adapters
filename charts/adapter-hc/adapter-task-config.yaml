@@ -1,6 +1,7 @@
 # HyperFleet Adapter - HostedCluster task configuration
-# Creates Namespace, pull-secret, signing-key, Certificate, and HostedCluster
-# on the target management cluster via Maestro ManifestWork over GCP Pub/Sub.
+# Creates Namespace, pull-secret, Certificate, and HostedCluster on the target
+# management cluster via Maestro ManifestWork over GCP Pub/Sub.
+# Depends on: adapter-placement-job (MC + DNS zone selection), adapter-signing-key (keypair).
 apiVersion: hyperfleet.redhat.com/v1alpha1
 kind: AdapterTaskConfig
 metadata:
@@ -23,12 +24,6 @@ spec:
       type: "int"
       required: true
 
-    - name: "baseDomain"
-      source: "env.HC_BASE_DOMAIN"
-      type: "string"
-      required: true
-      description: "Base domain for hosted cluster DNS (e.g. hc-us-central1-nkcw.int.gcp-hcp.devshift.net)"
-
     - name: "releaseImage"
       source: "env.HC_RELEASE_IMAGE"
       type: "string"
@@ -37,12 +32,12 @@ spec:
     - name: "pullSecretStoreName"
       source: "env.PULL_SECRET_STORE_NAME"
       type: "string"
-      default: "global-gcp-secret-manager"
+      default: "gcp-secret-manager"
 
     - name: "pullSecretGcpKey"
       source: "env.PULL_SECRET_GCP_KEY"
       type: "string"
-      default: "openshift-pull-secret"
+      default: "default-openshift-pull-secret"
 
   # ============================================================================
   # Phase 2: Preconditions - fetch cluster details from HyperFleet API
@@ -66,9 +61,6 @@ spec:
           expression: "spec.infraID"
         - name: "issuerURL"
           expression: "spec.?issuerURL.orValue('')"
-        - name: "serviceAccountSigningKey"
-          expression: "spec.?serviceAccountSigningKey.orValue('')"
-
         # GCP platform fields
         - name: "gcpProjectID"
           expression: "spec.platform.gcp.projectID"
@@ -118,10 +110,8 @@ spec:
           operator: "equals"
           value: "False"
 
-    # Fetch the placement decision from adapter-placement-job's status.
-    # The placement adapter writes data.managementClusterName with the
-    # Maestro consumerName of the selected MC.
-    - name: "placementStatus"
+    # Fetch placement and signing-key decisions from adapter statuses.
+    - name: "adapterStatuses"
       apiCall:
         method: "GET"
         url: "/clusters/{{ .clusterId }}/statuses"
@@ -129,6 +119,7 @@ spec:
         retryAttempts: 3
         retryBackoff: "exponential"
       capture:
+        # MC placement decision from adapter-placement-job
         - name: "targetCluster"
           expression: |
             items.filter(s, s.adapter == "adapter-placement-job").size() > 0
@@ -138,17 +129,38 @@ spec:
               ? items.filter(s, s.adapter == "adapter-placement-job")[0].data.managementClusterName
               : ""
 
-    # Gate: only proceed if placement has been decided and cluster is not Ready.
-    - name: "placementReady"
+        # DNS zone placement decision from adapter-placement-job
+        - name: "baseDomain"
+          expression: |
+            items.filter(s, s.adapter == "adapter-placement-job").size() > 0
+            && has(items.filter(s, s.adapter == "adapter-placement-job")[0].data)
+            && has(items.filter(s, s.adapter == "adapter-placement-job")[0].data.baseDomain)
+            && items.filter(s, s.adapter == "adapter-placement-job")[0].data.baseDomain != ""
+              ? items.filter(s, s.adapter == "adapter-placement-job")[0].data.baseDomain
+              : ""
+
+        # Signing key readiness from adapter-signing-key
+        - name: "signingKeyAvailable"
+          expression: |
+            items.filter(s, s.adapter == "adapter-signing-key").size() > 0
+            && has(items.filter(s, s.adapter == "adapter-signing-key")[0].conditions)
+            && items.filter(s, s.adapter == "adapter-signing-key")[0].conditions.filter(c, c.type == "Available").size() > 0
+              ? items.filter(s, s.adapter == "adapter-signing-key")[0].conditions.filter(c, c.type == "Available")[0].status
+              : "False"
+
+    # Gate: proceed only when MC and DNS placement are decided, signing key
+    # is available, and the cluster is not yet Ready.
+    - name: "dependenciesReady"
       expression: |
-        targetCluster != "" && readyConditionStatus == "False"
+        targetCluster != "" && baseDomain != "" && signingKeyAvailable == "True" && readyConditionStatus == "False"
 
   # ============================================================================
   # Phase 3: Resources - deliver via Maestro ManifestWork to the target MC
   #
-  # All 5 resources (Namespace, PullSecret, SigningKey, Certificate, HostedCluster)
-  # are bundled into a single ManifestWork. Maestro routes it to the target MC
-  # identified by targetCluster (read from adapter-placement-job's status).
+  # Resources (Namespace, PullSecret, Certificate, HostedCluster) are bundled
+  # into a single ManifestWork. Signing key is handled by adapter-signing-key.
+  # Maestro routes it to the target MC identified by targetCluster (read from
+  # adapter-placement-job's status). Gated on both placement and signing key.
   # ============================================================================
   resources:
     - name: "hostedClusterBundle"
@@ -157,16 +169,12 @@ spec:
         maestro:
           targetCluster: "{{ .targetCluster }}"
 
-      # ManifestWork definition lives in a separate file for readability.
-      # The framework loads and inlines it before template rendering.
       manifest:
         ref: "/etc/adapter/manifestwork.yaml"
 
-      # Discover the ManifestWork by name from Maestro
       discovery:
         byName: "{{ .clusterId }}-adapter-hc"
 
-      # Discover nested resources applied by the ManifestWork on the MC
       nestedDiscoveries:
         - name: "clusterNamespace"
           discovery:

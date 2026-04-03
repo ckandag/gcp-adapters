@@ -1,8 +1,9 @@
-# Placement Job - cross-checks Secret Manager and Maestro consumers
-# to select an eligible management cluster.
+# Placement Job - selects an eligible management cluster and DNS zone.
 #
-# Single container that runs the selection logic and patches the
-# Job's .status.conditions directly via the Kubernetes API.
+# Cross-checks Secret Manager secrets against Maestro consumers for MC
+# selection, then reads HC DNS domains from Secret Manager for DNS zone
+# placement. Patches the Job's .status.conditions with three condition
+# types: MCPlacement, DNSPlacement, and Available (aggregate).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -46,25 +47,44 @@ spec:
               CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
               API=https://kubernetes.default.svc
 
-              # Patch the Job's .status.conditions via the Kubernetes API.
-              patch_job_condition() {
-                local cond_status="$1" reason="$2" message="$3"
-                local payload
-                payload=$(python3 -c "
+              # Build a single JSON condition object.
+              build_condition() {
+                local cond_type="$1" cond_status="$2" reason="$3" message="$4"
+                python3 -c "
               import json, datetime
-              print(json.dumps({'status': {'conditions': [{
-                'type': 'Available',
+              print(json.dumps({
+                'type': '${cond_type}',
                 'status': '${cond_status}',
                 'reason': '${reason}',
                 'message': '${message}',
                 'lastTransitionTime': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-              }]}}))
+              }))
+              "
+              }
+
+              # Patch the Job's .status.conditions with an array of conditions.
+              patch_job_conditions() {
+                local conditions_json="$1"
+                local payload
+                payload=$(python3 -c "
+              import json
+              conditions = json.loads('${conditions_json}')
+              print(json.dumps({'status': {'conditions': conditions}}))
               ")
                 curl -sf --cacert "$CA" -H "Authorization: Bearer $TOKEN" \
                   -H "Content-Type: application/merge-patch+json" \
                   -X PATCH \
                   "${API}/apis/batch/v1/namespaces/${NAMESPACE}/jobs/placement-${CLUSTER_ID}/status" \
                   -d "${payload}" > /dev/null
+              }
+
+              # Patch a failure: sets MCPlacement=False and Available=False.
+              patch_failure() {
+                local reason="$1" message="$2"
+                local mc_cond avail_cond
+                mc_cond=$(build_condition "MCPlacement" "False" "$reason" "$message")
+                avail_cond=$(build_condition "Available" "False" "PlacementFailed" "$message")
+                patch_job_conditions "[${mc_cond},${avail_cond}]"
               }
 
               # ── Step 1: Secret Manager ─────────────────────────────────
@@ -79,7 +99,7 @@ spec:
                 echo "ERROR: No MC secrets found in Secret Manager"
                 cat "${_sm_err}" >&2
                 rm -f "${_sm_err}"
-                patch_job_condition "False" "NoMCSecrets" \
+                patch_failure "NoMCSecrets" \
                   "No management cluster secrets found in Secret Manager for project ${GCP_PROJECT_ID}"
                 exit 1
               fi
@@ -91,7 +111,7 @@ spec:
               MAESTRO_RESPONSE=$(curl -sf "${MAESTRO_URL}/api/maestro/v1/consumers?size=100" 2>/dev/null) || true
 
               if [ -z "${MAESTRO_RESPONSE}" ]; then
-                patch_job_condition "False" "MaestroUnavailable" \
+                patch_failure "MaestroUnavailable" \
                   "Failed to query Maestro API at ${MAESTRO_URL}"
                 exit 1
               fi
@@ -104,7 +124,7 @@ spec:
               " 2>/dev/null) || true
 
               if [ -z "${MAESTRO_MCS}" ]; then
-                patch_job_condition "False" "NoMaestroConsumers" \
+                patch_failure "NoMaestroConsumers" \
                   "No consumers registered in Maestro"
                 exit 1
               fi
@@ -117,21 +137,85 @@ spec:
                 <(echo "${MAESTRO_MCS}" | sort))
 
               if [ -z "${ELIGIBLE}" ]; then
-                patch_job_condition "False" "NoEligibleMC" \
+                patch_failure "NoEligibleMC" \
                   "No management clusters present in both Secret Manager and Maestro"
                 exit 1
               fi
               echo "Eligible MCs: $(echo ${ELIGIBLE} | tr '\n' ', ')"
 
-              # ── Step 4: Select MC (MVP: first eligible) ────────────────
-              # TODO: implement least-loaded selection by querying HyperFleet API
-              # for cluster counts per MC.
-              SELECTED=$(echo "${ELIGIBLE}" | head -1)
+              # ── Step 4: Select least-loaded MC ─────────────────────────
+              ELIGIBLE_COUNT=$(echo "${ELIGIBLE}" | wc -l | tr -d ' ')
+              if [ "${ELIGIBLE_COUNT}" -eq 1 ]; then
+                  SELECTED=$(echo "${ELIGIBLE}" | head -1)
+                  echo "Single eligible MC, skipping load query"
+              else
+                  echo "Querying HyperFleet API for cluster counts across ${ELIGIBLE_COUNT} MCs..."
+                  SELECTED=$(python3 -c "
+                  import json, urllib.request, sys
+
+                  eligible = '''${ELIGIBLE}'''.strip().split('\n')
+                  api_url = '${HYPERFLEET_API_URL}'
+                  mc_counts = {mc: 0 for mc in eligible}
+
+                  try:
+                      url = f'{api_url}/api/hyperfleet/v1/clusters?size=1000'
+                      with urllib.request.urlopen(url, timeout=10) as resp:
+                          clusters = json.load(resp)
+                      for cluster in clusters.get('items', []):
+                          for c in cluster.get('status', {}).get('conditions', []):
+                              if c.get('reason') == 'MCSelected' and c.get('status') == 'True':
+                                  mc = c.get('message', '')
+                                  if mc in mc_counts:
+                                      mc_counts[mc] += 1
+                                  break
+                  except Exception as e:
+                      print(eligible[0], end='')
+                      sys.stderr.write(f'HyperFleet API unavailable ({e}), falling back to first eligible\n')
+                      sys.exit(0)
+
+                  selected = min(eligible, key=lambda mc: mc_counts[mc])
+                  sys.stderr.write(f'Cluster counts: {mc_counts}\n')
+                  print(selected, end='')
+                  ")
+              fi
               echo "Selected MC: ${SELECTED}"
 
-              # ── Step 5: Patch Job condition with result ────────────────
-              patch_job_condition "True" "PlacementDecided" "${SELECTED}"
-              echo "=== Placement Complete: ${SELECTED} ==="
+              # ── Step 5: DNS zone selection ──────────────────────────────
+              echo "Reading HC DNS domains from Secret Manager..."
+              ARGOCD_SECRET_NAME=$(gcloud secrets list \
+                --project="${GCP_PROJECT_ID}" \
+                --filter='name:argocd-cluster AND labels.infra-type:region' \
+                --format='value(name)' --limit=1 2>/dev/null) || true
+
+              HC_DNS_DOMAINS=""
+              if [ -n "${ARGOCD_SECRET_NAME}" ]; then
+                HC_DNS_DOMAINS=$(gcloud secrets versions access latest \
+                  --secret="${ARGOCD_SECRET_NAME}" \
+                  --project="${GCP_PROJECT_ID}" 2>/dev/null \
+                  | python3 -c "import sys,json; print(json.load(sys.stdin).get('meta_hc_dns_domains',''))" 2>/dev/null) || true
+              fi
+
+              if [ -z "${HC_DNS_DOMAINS}" ]; then
+                MC_COND=$(build_condition "MCPlacement" "True" "MCSelected" "${SELECTED}")
+                DNS_COND=$(build_condition "DNSPlacement" "False" "NoDNSDomains" \
+                  "No HC DNS domains found in Secret Manager for project ${GCP_PROJECT_ID}")
+                AVAIL_COND=$(build_condition "Available" "False" "PlacementFailed" "DNS zone placement failed")
+                patch_job_conditions "[${MC_COND},${DNS_COND},${AVAIL_COND}]"
+                exit 1
+              fi
+
+              BASE_DOMAIN=$(echo "${HC_DNS_DOMAINS}" | tr ',' '\n' | head -1)
+              echo "Selected DNS zone: ${BASE_DOMAIN}"
+
+              # ── Step 6: Patch Job conditions with results ───────────────
+              MC_COND=$(build_condition "MCPlacement" "True" "MCSelected" "${SELECTED}")
+              DNS_COND=$(build_condition "DNSPlacement" "True" "DNSZoneSelected" "${BASE_DOMAIN}")
+              AVAIL_COND=$(build_condition "Available" "True" "PlacementDecided" "MC and DNS zone placement completed")
+              patch_job_conditions "[${MC_COND},${DNS_COND},${AVAIL_COND}]"
+
+              echo "=== Placement Complete ==="
+              echo "  MC:       ${SELECTED}"
+              echo "  DNS Zone: ${BASE_DOMAIN}"
           env:
             - name: CLUSTER_ID
               value: "{{ .clusterId }}"
@@ -141,6 +225,8 @@ spec:
               value: "{{ .gcpProjectId }}"
             - name: MAESTRO_URL
               value: "{{ .maestroUrl }}"
+            - name: HYPERFLEET_API_URL
+              value: "{{ .hyperfleetApiUrl }}"
           resources:
             requests:
               cpu: 100m

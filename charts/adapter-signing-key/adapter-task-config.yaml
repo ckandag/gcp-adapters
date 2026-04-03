@@ -53,14 +53,14 @@ spec:
         - name: "issuerURL"
           expression: "spec.?issuerURL.orValue('')"
 
+        # Optional: caller-provided signing key (base64-encoded PKCS#1 PEM).
+        # If present, the Job uses this instead of generating a new keypair.
+        - name: "signingKeyPEM"
+          expression: "spec.?signingKey.orValue('')"
+
         # GCP platform fields
         - name: "gcpProjectID"
           expression: "spec.platform.gcp.projectID"
-
-        # Target MC consumer name (= MC project_id)
-        - name: "targetCluster"
-          expression: "spec.platform.gcp.projectID"
-          description: "Maestro consumerName of the target management cluster"
 
         # Ready condition check
         - name: "readyConditionStatus"
@@ -74,9 +74,36 @@ spec:
           operator: "equals"
           value: "False"
 
-    - name: "validationCheck"
+    # Fetch the placement decision from adapter-placement-job's status.
+    - name: "placementStatus"
+      apiCall:
+        method: "GET"
+        url: "/clusters/{{ .clusterId }}/statuses"
+        timeout: 10s
+        retryAttempts: 3
+        retryBackoff: "exponential"
+      capture:
+        - name: "targetCluster"
+          expression: |
+            items.filter(s, s.adapter == "adapter-placement-job").size() > 0
+            && has(items.filter(s, s.adapter == "adapter-placement-job")[0].data)
+            && has(items.filter(s, s.adapter == "adapter-placement-job")[0].data.managementClusterName)
+            && items.filter(s, s.adapter == "adapter-placement-job")[0].data.managementClusterName != ""
+              ? items.filter(s, s.adapter == "adapter-placement-job")[0].data.managementClusterName
+              : ""
+
+        - name: "placementAvailable"
+          expression: |
+            items.filter(s, s.adapter == "adapter-placement-job").size() > 0
+            && has(items.filter(s, s.adapter == "adapter-placement-job")[0].conditions)
+            && items.filter(s, s.adapter == "adapter-placement-job")[0].conditions.filter(c, c.type == "Available").size() > 0
+              ? items.filter(s, s.adapter == "adapter-placement-job")[0].conditions.filter(c, c.type == "Available")[0].status
+              : "False"
+
+    # Gate: only proceed if placement fully succeeded and cluster is not Ready.
+    - name: "placementReady"
       expression: |
-        readyConditionStatus == "False"
+        targetCluster != "" && placementAvailable == "True" && readyConditionStatus == "False"
 
   # ============================================================================
   # Phase 3: Resources - deliver keygen Job via Maestro ManifestWork to MC
@@ -207,10 +234,10 @@ spec:
             signingKey:
               secretName:
                 expression: |
-                  "\"" + clusterName + "-signing-key\""
+                  clusterName + "-signing-key"
               namespace:
                 expression: |
-                  "\"clusters-\" + clusterId"
+                  "clusters-" + clusterId
 
     postActions:
       - name: "reportSigningKeyStatus"

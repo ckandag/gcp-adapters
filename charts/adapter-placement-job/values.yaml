@@ -3,7 +3,7 @@ hyperfleet-adapter:
     registry: quay.io/openshift-hyperfleet
     repository: hyperfleet-adapter
     pullPolicy: Always
-    tag: v0.1.0
+    tag: v0.1.1
 
   adapterConfig:
     create: true
@@ -16,7 +16,7 @@ hyperfleet-adapter:
   broker:
     create: true
     googlepubsub:
-      projectId: ""
+      projectId: "dev-reg-us-c1-ckandag910f"
       subscriptionId: hyperfleet-cluster-events-adapter-placement-job
       topic: hyperfleet-cluster-events
       createTopicIfMissing: false
@@ -25,7 +25,8 @@ hyperfleet-adapter:
   serviceAccount:
     create: true
     name: hyperfleet-adapter-placement-job
-    annotations: {}
+    annotations:
+      iam.gke.io/gcp-service-account: placement-adapter@dev-reg-us-c1-ckandag910f.iam.gserviceaccount.com
 
   env:
     - name: NAMESPACE
@@ -37,9 +38,11 @@ hyperfleet-adapter:
         fieldRef:
           fieldPath: spec.serviceAccountName
     - name: GCP_PROJECT_ID
-      value: ""
+      value: "dev-reg-us-c1-ckandag910f"
     - name: MAESTRO_URL
       value: "http://maestro.hyperfleet.svc.cluster.local:8000"
+    - name: HYPERFLEET_API_URL
+      value: "http://hyperfleet-api.hyperfleet.svc.cluster.local:8000"
     - name: PLACEMENT_IMAGE
       value: "google/cloud-sdk:slim"
 

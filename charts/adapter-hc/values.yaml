@@ -5,7 +5,7 @@ hyperfleet-adapter:
     registry: quay.io/openshift-hyperfleet
     repository: hyperfleet-adapter
     pullPolicy: Always
-    tag: v0.1.0
+    tag: v0.1.1
 
   adapterConfig:
     create: true
@@ -18,7 +18,7 @@ hyperfleet-adapter:
   broker:
     create: true
     googlepubsub:
-      projectId: ""
+      projectId: "dev-reg-us-c1-ckandag910f"
       subscriptionId: hyperfleet-cluster-events-adapter-hc
       topic: hyperfleet-cluster-events
       createTopicIfMissing: false
@@ -27,21 +27,20 @@ hyperfleet-adapter:
   serviceAccount:
     create: true
     name: hyperfleet-adapter-hc
-    annotations: {}
+    annotations:
+      iam.gke.io/gcp-service-account: hc-adapter@dev-reg-us-c1-ckandag910f.iam.gserviceaccount.com
 
   env:
     - name: NAMESPACE
       valueFrom:
         fieldRef:
           fieldPath: metadata.namespace
-    - name: HC_BASE_DOMAIN
-      value: "us-central1-ckandagcd56-1.dev.gcp-hcp.devshift.net"
     - name: HC_RELEASE_IMAGE
       value: "quay.io/openshift-release-dev/ocp-release:4.20.0-x86_64"
     - name: PULL_SECRET_STORE_NAME
-      value: "global-gcp-secret-manager"
+      value: "gcp-secret-manager"
     - name: PULL_SECRET_GCP_KEY
-      value: "openshift-pull-secret"
+      value: "default-openshift-pull-secret"
 
   rbac:
     resources:

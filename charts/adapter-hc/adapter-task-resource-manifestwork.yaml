@@ -59,23 +59,7 @@ spec:
               remoteRef:
                 key: "{{ .pullSecretGcpKey }}"
 
-      # --- Manifest 2: Signing Key Secret ---
-      - apiVersion: v1
-        kind: Secret
-        metadata:
-          name: "{{ .clusterName }}-signing-key"
-          namespace: "clusters-{{ .clusterId }}"
-          labels:
-            hyperfleet.io/cluster-id: "{{ .clusterId }}"
-            hyperfleet.io/managed-by: "adapter-hc"
-            hyperfleet.io/resource-type: "signing-key"
-          annotations:
-            hyperfleet.io/generation: "{{ .generation }}"
-        type: Opaque
-        data:
-          key: "{{ .serviceAccountSigningKey }}"
-
-      # --- Manifest 3: API Server Certificate ---
+      # --- Manifest 2: API Server Certificate ---
       - apiVersion: cert-manager.io/v1
         kind: Certificate
         metadata:
@@ -109,7 +93,7 @@ spec:
             kind: ClusterIssuer
             group: cert-manager.io
 
-      # --- Manifest 4: HostedCluster ---
+      # --- Manifest 3: HostedCluster ---
       - apiVersion: hypershift.openshift.io/v1beta1
         kind: HostedCluster
         metadata:
