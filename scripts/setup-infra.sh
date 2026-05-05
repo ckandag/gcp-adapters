@@ -17,7 +17,7 @@
 #   ./setup-infra.sh <infra-id> <project-id> [region] [vpc-cidr]
 #
 # Example:
-#   ./setup-infra.sh hctest20 dev-mgt-us-c1-ckandag910f us-central1
+#   ./setup-infra.sh hctest20 ck-hcp-test us-central1
 
 set -euo pipefail
 
@@ -29,7 +29,7 @@ PROJECT_ID="${2:?Usage: $0 <infra-id> <project-id> [region] [vpc-cidr]}"
 REGION="${3:-us-central1}"
 VPC_CIDR="${4:-10.0.0.0/24}"
 
-HYPERSHIFT_BIN="${HYPERSHIFT_BINARY:-$(command -v hypershift 2>/dev/null || true)}"
+HYPERSHIFT_BIN="${HYPERSHIFT_BINARY:-/Users/ckandaga/gcp-hcp/repos/ck-hypershift/bin/hypershift}"
 if [[ -z "$HYPERSHIFT_BIN" ]]; then
   echo "ERROR: hypershift CLI not found. Install it or set HYPERSHIFT_BINARY."
   exit 1

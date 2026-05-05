@@ -14,9 +14,8 @@
 #   --test-label <value>      Set the test label
 #
 # Example:
-#   ./e2e-create-cluster.sh hctest20 dev-mgt-us-c1-ckandag910f
-#   ./e2e-create-cluster.sh hctest20 dev-mgt-us-c1-ckandag910f \
-#     --network dev-mgt-us-c1-vpc --subnet dev-mgt-us-c1-vpc-psc-subnet-0
+#   ./e2e-create-cluster.sh hctest20 ck-hcp-test
+#    
 
 set -euo pipefail
 

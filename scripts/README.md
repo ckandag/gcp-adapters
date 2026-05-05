@@ -1,545 +1,596 @@
-# HyperFleet GCP Adapters — Dev Testing Guide
+# HyperFleet Dev Testing Playbook
 
-## What is HyperFleet?
+## Architecture
 
-HyperFleet is a cluster lifecycle management system for provisioning and managing OpenShift Hosted Control Planes (HCP) on GCP at scale. It uses an event-driven adapter architecture where a central API stores cluster state, a sentinel publishes reconcile events via GCP Pub/Sub, and independent config-driven adapters execute specific lifecycle tasks.
-
-### Architecture Overview
+HyperFleet provisions OpenShift Hosted Control Planes (HCP) on GCP at scale using an event-driven adapter architecture.
 
 ```
-User → HyperFleet API (CRUD) → Sentinel (polls + publishes CloudEvents) → GCP Pub/Sub (fan-out)
-    ↑                                                                            │
-    │ POST /statuses                                    ┌────────────────────────┼──────────────────────┐
-    │                                                   ↓                        ↓                      ↓
-    └──────────────────────────────────────── adapter-placement-job    adapter-signing-key         adapter-hc
-                                              (select MC via Job)      (keygen via Maestro)      (HC via Maestro)
-                                                     │                        │                       │
-                                                     │               ┌────────┴───────┐      ┌────────┴───────┐
-                                                     │               ↓                ↓      ↓                ↓
-                                                     │          Maestro Server   Maestro Server          Maestro Server
-                                                     │               ↓                ↓                       ↓
-                                                     │          Maestro Agent    Maestro Agent          Maestro Agent
-                                                     │          (MC: keygen     (MC: apply              (MC: apply
-                                                     │           Job + RBAC)     HostedCluster)          HostedCluster)
-                                                     │               │                │                       │
-                                                     ↓               ↓                ↓                       ↓
-                                              HyperFleet API  ←───────────── status reports ─────────────────┘
+User → HyperFleet API (CRUD) → Sentinel (polls + publishes CloudEvents) → GCP Pub/Sub
+  ↑                                                                            │
+  │ POST /statuses                                      ┌──────────────────────┤
+  │                                                     ↓                      ↓
+  └──────────────────────────────────── adapter-placement-job            adapter-hc
+                                        (select MC via Job)       (HC via Maestro → MC)
+                                               │                          │
+                                               ↓                          ↓
+                                        HyperFleet API            Maestro Server → Agent
+                                                                  (applies HC on MC)
 ```
 
-Adapters are deployments of the same `hyperfleet-adapter` binary with different YAML configs (AdapterConfig + AdapterTaskConfig). Each adapter executes a 4-phase pipeline:
+### Components
 
-1. **params** — extract parameters from the event and environment
-2. **preconditions** — fetch cluster data from the API, evaluate gates (CEL expressions)
-3. **resources** — create/update resources (Kubernetes Job or Maestro ManifestWork)
-4. **post** — evaluate status conditions (CEL), POST status to HyperFleet API
+| Component | Runs on | Purpose |
+|---|---|---|
+| HyperFleet API | Region cluster (`hyperfleet` ns) | Stateless CRUD + status storage (PostgreSQL) |
+| Sentinel | Region cluster (`hyperfleet` ns) | Watches API, publishes `Cluster.reconcile` CloudEvents to Pub/Sub |
+| Maestro Server | Region cluster (`hyperfleet` ns) | Routes ManifestWork to MCs via gRPC + Pub/Sub |
+| Maestro Agent | Management cluster (`maestro` ns) | Applies ManifestWork, reports status back |
+| Adapters | Region cluster (`hyperfleet` ns) | Subscribe to Pub/Sub, execute tasks, report status to API |
 
-Every adapter reports three mandatory conditions: `Applied`, `Available`, `Health`.
-
-### Responsibility Boundary
-
-Adapters operate exclusively within Red Hat-managed infrastructure (region + MC clusters). They have no direct access to customer GCP projects. All customer-side setup (WIF, VPC, PSC, IAM) is a prerequisite completed before the cluster creation request.
-
-```
-CUSTOMER RESPONSIBILITY (via CLI)            RED HAT / ADAPTER RESPONSIBILITY
-═════════════════════════════════            ════════════════════════════════
-
-Customer GCP Project:                        Regional + MC Infrastructure:
-  • Create WIF Pool + Provider                 • Select management cluster (placement)
-  • Configure OIDC issuer URL                  • Generate signing keypair on MC
-  • Grant WIF pool access to SAs               • Push public key to OIDC issuer bucket
-  • Create VPC / subnets / PSC                 • Create HostedCluster on MC
-  • Enable required GCP APIs                   • Provision pull secret (ESO)
-  • IAM roles for control plane SAs            • Create NodePools on MC (planned)
-  • Grant read-only access to RH               • Manage HC lifecycle (update/delete)
-    validation SA
-
-  Done BEFORE calling create cluster         Done BY adapters AFTER cluster
-                                             creation request
-```
-
-### Key Components
-
-| Component | Location | Purpose |
-|-----------|----------|---------|
-| **HyperFleet API** | `hyperfleet` ns on region cluster | Stateless REST API — pure CRUD + status storage in PostgreSQL |
-| **Sentinel** | `hyperfleet` ns on region cluster | Watches API for changes, publishes `Cluster.reconcile` CloudEvents to Pub/Sub |
-| **Maestro Server** | `hyperfleet` ns on region cluster | Receives ManifestWork bundles from adapters, routes them to target MCs via gRPC + Pub/Sub |
-| **Maestro Agent** | `maestro` ns on management cluster | Applies ManifestWork resources on MC, reports status back to Maestro Server via Pub/Sub |
-| **GCP Adapters** | `hyperfleet` ns on region cluster | Subscribe to Pub/Sub events, execute tasks, report status to HyperFleet API |
-
-### Infrastructure Layout
+### Adapter Execution Order
 
 ```
-Region Cluster (GKE Autopilot, one per region)
-├── HyperFleet core (API, Sentinel)
-├── GCP HCP Adapters (adapter-placement-job, adapter-signing-key, adapter-hc)
-├── Adapter GCP resources (adapter-resources chart: SAs, WIF, Pub/Sub subscriptions)
-├── Maestro Server
-└── Region GCP resources: Maestro Pub/Sub topics, Cloud SQL, HyperFleet Pub/Sub topic
-
-Management Cluster (GKE, one or more per region)
-├── Maestro Agent  ← receives ManifestWork, applies resources, reports status
-├── HyperShift Operator
-└── HostedCluster workloads (namespaces: clusters-{clusterId})
+placement-adapter → hc-adapter
+(select MC)         (create HostedCluster via Maestro)
 ```
 
-### Maestro Messaging Layer
+Each adapter gates on the previous via CEL preconditions. Placement is sticky — once decided, the MC assignment doesn't change.
 
-Maestro replaces direct kubeconfig-based access with asynchronous GCP Pub/Sub channels, removing cross-cluster network dependencies. It uses 4 shared Pub/Sub topics per region:
+### Key IDs
 
-| Topic | Direction | Purpose |
-|-------|-----------|---------|
-| `sourceevents` | Server → Agent | Targeted work delivery (filtered per MC via subscription) |
-| `sourcebroadcast` | Server → All Agents | Broadcast commands |
-| `agentevents` | Agent → Server | Status updates |
-| `agentbroadcast` | Agent → All Server instances | Status broadcast (HA) |
+| Field | Format | Source | Example |
+|---|---|---|---|
+| `id` | UUIDv7 | HyperFleet API (auto-generated) | `019df41a-e34c-7595-a3d6-e143f28eb106` |
+| `spec.clusterID` | RFC4122 UUID | Client payload OR fallback to `id` | `19ae7094-f73a-41e0-af10-89289d8f75a8` |
+| `spec.infraID` | Short alphanumeric | Client payload | `hctest24` |
 
-Agent isolation is achieved via **per-MC subscriptions** with Pub/Sub filters on the `ce-clustername` attribute — each agent only receives work intended for its MC.
-
-A separate **HyperFleet Pub/Sub topic** (`hyperfleet-cluster-events`) is used for Sentinel → Adapter communication. Each adapter gets its own subscription with independent delivery.
-
-### Consumer Registration
-
-Each MC must be registered as a Maestro consumer before it can receive ManifestWork. A `maestro-consumer-registration` CronJob on the region cluster reconciles every 5 minutes:
-1. Lists Secret Manager secrets labeled `maestro-consumer-name:*`
-2. Compares against registered Maestro consumers
-3. Registers any missing MCs
-
-This is idempotent and self-healing — handles transient failures, Maestro restarts, and new MC onboarding automatically.
-
-### Status Feedback Loop
-
-The adapters close the status loop — there is no direct Maestro Server → HyperFleet API integration:
-
-```
-1. Adapter sends ManifestWork to Maestro Server
-2. Maestro Server delivers to MC Agent via Pub/Sub (sourceevents topic)
-3. Agent applies resources on MC, reports status back via Pub/Sub (agentevents topic)
-4. Maestro Server stores status, streams it to adapter via gRPC CloudEvents
-5. Adapter discovers resource status (ManifestWork conditions + statusFeedback)
-6. Adapter evaluates CEL expressions against discovered status
-7. Adapter POSTs evaluated conditions to HyperFleet API: POST /clusters/{id}/statuses
-```
+With HyperFleet API v0.2.1+, the `id` field is a UUIDv7 (valid RFC4122). If `spec.clusterID` is omitted from the payload, the HC adapter's CEL expression `spec.?clusterID.orValue(id)` falls back to `id`, which now passes HyperShift's UUID validation. You no longer need to generate `clusterID` client-side.
 
 ---
 
-## GCP Adapters
-
-All adapters run on the **region cluster** in the `hyperfleet` namespace. They subscribe to the same Pub/Sub topic (`hyperfleet-cluster-events`) with separate subscriptions, so all adapters receive every event independently.
-
-### Adapter Execution Order (Dependencies)
-
-```
-adapter-placement-job  ──→  adapter-signing-key  ──→  adapter-hc  ──→  adapter-nodepool (planned)
-(select MC)                 (generate keys on MC)      (create HC)      (create NodePools)
-```
-
-Each adapter gates on the previous adapter's status via CEL preconditions:
-- `adapter-signing-key` waits for `adapter-placement-job` to set `data.managementClusterName`
-- `adapter-hc` waits for both placement decision AND `adapter-signing-key` Available=True
-- Placement is **sticky** — once decided, the MC assignment does not change on spec updates
-
-**Planned adapters** (not yet implemented):
-- `validation-adapter` — validates customer GCP project setup (APIs, WIF, VPC, IAM) before placement
-- `adapter-nodepool` — creates NodePool CRs on the MC after HostedCluster is available
-
-### 1. adapter-placement-job
-
-**Purpose**: Select a management cluster (MC) for a new hosted cluster.
-
-**How it works**:
-1. Receives `Cluster.reconcile` event
-2. Fetches cluster details from HyperFleet API (precondition)
-3. Checks if placement already decided — if yes, skips (gate closes, idempotent)
-4. Creates a Kubernetes Job on the region cluster that:
-   - Queries GCP Secret Manager for MC secrets (labeled `maestro-consumer-name`)
-   - Queries Maestro API for registered consumers
-   - Cross-checks both lists — an MC is eligible only if it appears in **both** sources
-   - If multiple eligible: queries HyperFleet API for cluster counts per MC, picks least-loaded
-   - If single eligible: skips the HyperFleet API query (optimization)
-   - Patches its own Job `.status.conditions` with the selected MC name
-5. Reports placement status (including `data.managementClusterName`) to HyperFleet API
-
-**MC Eligibility — Dual-Source Cross-Check**:
-
-| Scenario | Secret Manager | Maestro Consumer | Eligible? |
-|----------|---------------|-----------------|-----------|
-| MC fully provisioned and healthy | present | present | **Yes** |
-| MC provisioned but agent not connected | present | absent | **No** |
-| MC being decommissioned | absent | present | **No** |
-| MC being provisioned | absent | absent | **No** |
-
-**Helm chart**: `charts/adapter-placement-job/`
-
-**Key env vars**:
-- `GCP_PROJECT_ID` — regional GCP project for Secret Manager lookups
-- `MAESTRO_URL` — Maestro server HTTP endpoint
-- `HYPERFLEET_API_URL` — HyperFleet API endpoint for least-loaded query
-
-### 2. adapter-signing-key
-
-**Purpose**: Generate an RSA signing keypair for the HostedCluster's API server on the MC.
-
-**Security model**: Private key material never flows through HyperFleet API, Maestro payloads, or Pub/Sub. The adapter sends only resource definitions (Job, RBAC) via Maestro — key generation happens entirely on the MC.
-
-**How it works**:
-1. Receives `Cluster.reconcile` event
-2. Fetches cluster details and placement status from HyperFleet API
-3. Gates on: placement decided AND cluster not Ready
-4. Sends a ManifestWork to the target MC (via Maestro) containing:
-   - Namespace (`clusters-{clusterId}`)
-   - ServiceAccount with WIF annotation (GCS write access for issuer bucket)
-   - RBAC (Role + RoleBinding for creating Secrets in namespace)
-   - Keygen Job — generates RSA keypair, creates K8s Secret (private key stays on MC), uploads JWKS to GCS issuer bucket
-5. Monitors Job completion via Maestro statusFeedback
-6. Reports signing key status (Applied, Available, Health) to HyperFleet API
-
-**Idempotency**: The keygen Job checks if the K8s Secret already exists before generating. If present and valid, it exits successfully without regenerating.
-
-**Helm chart**: `charts/adapter-signing-key/`
-
-**Key env vars**:
-- `KEYGEN_IMAGE` — container image for keygen Job (default: `google/cloud-sdk:slim`)
-- `KEYGEN_GCP_SA` — GCP SA email with GCS write access to OIDC issuer bucket
-
-### 3. adapter-hc
-
-**Purpose**: Create the HostedCluster and supporting resources on the management cluster.
-
-**How it works**:
-1. Receives `Cluster.reconcile` event
-2. Fetches cluster details and adapter statuses from HyperFleet API
-3. Gates on: placement decided AND signing key available AND cluster not Ready
-4. Sends a ManifestWork to the target MC (via Maestro) containing:
-   - Namespace (`clusters-{clusterId}`)
-   - Pull secret (ExternalSecret from ClusterSecretStore → GCP Secret Manager)
-   - Certificate (cert-manager, for API server TLS)
-   - HostedCluster CR (`hypershift.openshift.io/v1beta1`) with full GCP platform spec, WIF config, network config
-5. Reports HostedCluster status (Applied, Available, Health) to HyperFleet API via CEL expressions:
-   - **Applied**: from ManifestWork `Applied` condition (Maestro agent accepted and applied)
-   - **Available**: from HostedCluster's `Available` condition (via Maestro `statusFeedback.values`)
-   - **Health**: inverse of HostedCluster's `Degraded` condition (via Maestro `statusFeedback.values`)
-
-**Helm chart**: `charts/adapter-hc/`
-
-**Key env vars**:
-- `HC_RELEASE_IMAGE` — OpenShift release image (e.g. `quay.io/openshift-release-dev/ocp-release:4.20.0-x86_64`)
-- `PULL_SECRET_STORE_NAME` — ClusterSecretStore name for pull secret (default: `gcp-secret-manager`)
-- `PULL_SECRET_GCP_KEY` — GCP Secret Manager key for the pull secret (default: `default-openshift-pull-secret`)
-
-### 4. adapter-resources
-
-**Purpose**: Provisions GCP infrastructure for the adapters (not a runtime adapter itself).
-
-**Creates via Config Connector**:
-- GCP Service Account per adapter (with descriptive display name)
-- Workload Identity Federation binding (K8s SA → GCP SA via IAMPolicyMember)
-- Pub/Sub subscription per adapter (on `hyperfleet-cluster-events` topic)
-- Pub/Sub IAM bindings (subscriber + viewer on subscription, viewer on topic)
-- Extra project-level IAM roles where needed (e.g. `roles/secretmanager.viewer` for placement)
-
-**Helm chart**: `charts/adapter-resources/`
-
----
-
-## Dev Environment Setup
-
-### Prerequisites
-
-- `gcloud` CLI authenticated
-- `kubectl` configured
-- `helm` installed
-- Access to the dev GCP projects
-
-### Login to Clusters
+## Login to Clusters
 
 ```bash
-# Login to region cluster
+# Region cluster (where HyperFleet core + adapters run)
 bash /Users/ckandaga/gcp-hcp/repos/ck-gcp-hcp-infra/terraform/config/dev-all-in-one/ckandag/login-region.sh
 
-# Login to management cluster
+# Management cluster (where HostedClusters run)
 bash /Users/ckandaga/gcp-hcp/repos/ck-gcp-hcp-infra/terraform/config/dev-all-in-one/ckandag/login-management.sh
 ```
 
-### Deploy Adapters (Helm)
+---
 
-All adapters deploy to the `hyperfleet` namespace on the region cluster. Login to the region cluster first.
+## Patching / Updating Components
 
-```bash
-CHARTS_DIR=/Users/ckandaga/gcp-hcp/repos/ck-gcp-adapters/charts
+All HyperFleet components are deployed via ArgoCD on the region cluster. Configuration lives in two places:
 
-# 1. Deploy adapter-resources (GCP infra — do this first)
-helm upgrade --install adapter-resources "$CHARTS_DIR/adapter-resources" \
-  -n hyperfleet --create-namespace
+- **ArgoCD templates**: `ck-gcp-hcp-infra/.worktree/dev-ckandag/argocd/config/region/<component>/template.yaml`
+- **Helm chart values**: `ck-gcp-hcp-infra/helm/charts/<component>/values.yaml` (for infra-managed charts like adapters)
 
-# 2. Deploy adapter-placement-job
-helm upgrade --install adapter-placement-job "$CHARTS_DIR/adapter-placement-job" \
-  -n hyperfleet \
-  --set-file 'hyperfleet-adapter.adapterConfigFile=charts/adapter-placement-job/adapter-config.yaml' \
-  --set-file 'hyperfleet-adapter.adapterTaskConfigFile=charts/adapter-placement-job/adapter-task-config.yaml'
+### How to Update a Component Version
 
-# 3. Deploy adapter-signing-key
-helm upgrade --install adapter-signing-key "$CHARTS_DIR/adapter-signing-key" \
-  -n hyperfleet \
-  --set-file 'hyperfleet-adapter.adapterConfigFile=charts/adapter-signing-key/adapter-config.yaml' \
-  --set-file 'hyperfleet-adapter.adapterTaskConfigFile=charts/adapter-signing-key/adapter-task-config.yaml'
-
-# 4. Deploy adapter-hc
-helm upgrade --install adapter-hc "$CHARTS_DIR/adapter-hc" \
-  -n hyperfleet \
-  --set-file 'hyperfleet-adapter.adapterConfigFile=charts/adapter-hc/adapter-config.yaml' \
-  --set-file 'hyperfleet-adapter.adapterTaskConfigFile=charts/adapter-hc/adapter-task-config.yaml'
-```
-
-After deploying, **always restart adapter pods** if ConfigMaps changed (Helm does not auto-restart on ConfigMap updates):
+1. **Edit the ArgoCD template** — change `targetRevision` and `image.tag`:
 
 ```bash
-kubectl rollout restart deploy/adapter-placement-job-hyperfleet-adapter -n hyperfleet
-kubectl rollout restart deploy/adapter-signing-key-hyperfleet-adapter -n hyperfleet
-kubectl rollout restart deploy/adapter-hc-hyperfleet-adapter -n hyperfleet
+# Example: bump hyperfleet-api from v0.2.0 to v0.2.1
+# In argocd/config/region/hyperfleet-api/template.yaml:
+#   targetRevision: 'v0.2.1'
+#   image.tag: "v0.2.1"
 ```
+
+2. **Render** — ArgoCD reads rendered files, not config:
+
+```bash
+cd /Users/ckandaga/gcp-hcp/repos/ck-gcp-hcp-infra/.worktree/dev-ckandag/argocd
+uv run scripts/render.py
+```
+
+3. **Commit and push**:
+
+```bash
+cd /Users/ckandaga/gcp-hcp/repos/ck-gcp-hcp-infra/.worktree/dev-ckandag
+git add -A && git commit -m "chore: bump <component> to <version>" && git push
+```
+
+4. **Verify ArgoCD sync** (from region cluster):
+
+```bash
+kubectl get application <component> -n argocd \
+  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status'
+```
+
+5. **Force sync if needed** — ArgoCD may cache the old chart revision:
+
+```bash
+kubectl -n argocd patch application <component> --type merge \
+  -p '{"operation":{"initiatedBy":{"username":"cli"},"sync":{"revision":"","syncStrategy":{"hook":{}}}}}'
+```
+
+6. **Verify the image rolled out**:
+
+```bash
+kubectl get deployments -n hyperfleet \
+  -o custom-columns='NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image,READY:.status.readyReplicas'
+```
+
+7. **Restart pods if the image didn't change** (e.g. config-only update):
+
+```bash
+kubectl rollout restart deployment/<component> -n hyperfleet
+kubectl rollout status deployment/<component> -n hyperfleet --timeout=60s
+```
+
+### Component Template Locations
+
+| Component | ArgoCD Template |
+|---|---|
+| hyperfleet-api | `argocd/config/region/hyperfleet-api/template.yaml` |
+| hyperfleet-sentinel | `argocd/config/region/hyperfleet-sentinel/template.yaml` |
+| hyperfleet-hc-adapter | `argocd/config/region/hyperfleet-hc-adapter/template.yaml` |
+| hyperfleet-placement-adapter | `argocd/config/region/hyperfleet-placement-adapter/template.yaml` |
+
+### Overriding HC Adapter Env Vars
+
+The HC adapter supports env var overrides in its ArgoCD template under `hyperfleet-adapter.env`. Useful for testing custom images:
+
+```yaml
+env:
+  - name: HC_RELEASE_IMAGE
+    value: "quay.io/openshift-release-dev/ocp-release:4.22.0-ec.4-x86_64"
+  - name: HC_CPO_IMAGE
+    value: ""  # set a custom CPO image here to override
+  - name: HC_CAPG_IMAGE
+    value: ""  # set a custom CAPG image here to override
+  - name: HC_CONTROLLER_AVAILABILITY_POLICY
+    value: "HighlyAvailable"
+```
+
+After editing, render → push → verify sync → restart pod.
 
 ---
 
-## Testing Cluster Creation
+## Creating a Test Cluster
 
-### Step 1: Port-forward to HyperFleet API
+### Prerequisites
+
+- Logged in to **region cluster** (`login-region.sh`)
+- Port-forward to HyperFleet API running (scripts auto-start it if needed)
+- GCP infrastructure set up for the cluster (`setup-infra.sh`)
+
+### Quick Path (end-to-end)
+
+```bash
+cd /Users/ckandaga/gcp-hcp/hcp-workdir/hyperfleet/scripts
+
+# One command: setup infra + generate payload + create cluster
+./e2e-create-cluster.sh hctest30 ck-hcp-test --signing-key
+```
+
+### Step-by-Step Path
+
+#### 1. Setup GCP Infrastructure (one-time per infra-id)
+
+Creates WIF pool/provider, IAM service accounts, VPC/subnet:
+
+```bash
+./setup-infra.sh hctest30 ck-hcp-test
+```
+
+Output goes to `output/hctest30/` (iam-config.json, infra-config.json, signing key).
+
+#### 2. Generate Cluster Payload
+
+```bash
+./gen-payload.sh hctest30 --signing-key
+```
+
+This produces `hctest30-payload.json`. Key options:
+- `--infra-id <id>` — use a different infra-id (default: same as cluster name)
+- `--network <name>` / `--subnet <name>` — override VPC (e.g. use MC's existing VPC)
+- `--signing-key` — include the signing key in the payload
+- `--endpoint-access Private` — private API endpoint
+
+**Note on clusterID**: With API v0.2.1+, `spec.clusterID` is optional. If omitted, the adapter uses the HyperFleet `id` (UUIDv7) as `spec.clusterID`. The `gen-payload.sh` script has UUID generation commented out by default.
+
+#### 3. Create the Cluster
+
+```bash
+./create-cluster.sh hctest30-payload.json
+```
+
+Save the `id` from the response — you'll need it for status checks.
+
+---
+
+## Checking Cluster Status After Creation
+
+### The Right Way: API Status Endpoints
+
+**Always use the HyperFleet API to check status.** Don't crawl adapter logs.
+
+#### Port-forward (if not already running)
 
 ```bash
 kubectl port-forward svc/hyperfleet-api 8000:8000 -n hyperfleet &
 ```
 
-### Step 2: Create a Cluster Payload
-
-Create a JSON file (see `hc-test12-payload.json` for reference). Key fields:
-
-```json
-{
-  "name": "hc-test12",
-  "labels": {
-    "env": "dev",
-    "test": "v0.1.1-e2e",
-    "shard": "1"
-  },
-  "spec": {
-    "infraID": "hctest12",
-    "issuerURL": "https://storage.googleapis.com/hctest12-oidc-issuer",
-    "platform": {
-      "type": "GCP",
-      "gcp": {
-        "projectID": "dev-mgt-us-c1-ckandag910f",
-        "region": "us-central1",
-        "network": "dev-mgt-us-c1-vpc",
-        "subnet": "dev-mgt-us-c1-vpc-psc-subnet-0",
-        "endpointAccess": "Private",
-        "workloadIdentity": {
-          "projectNumber": "165380755215",
-          "poolID": "hctest12-wi-pool",
-          "providerID": "hctest12-k8s-provider",
-          "serviceAccountsRef": {
-            "controlPlaneEmail": "...",
-            "nodePoolEmail": "...",
-            "cloudControllerEmail": "...",
-            "storageEmail": "...",
-            "imageRegistryEmail": "..."
-          }
-        }
-      }
-    },
-    "clusterID": "93fdfa30-ca4c-4d6e-b47e-bee189e08254"
-  },
-  "kind": "Cluster"
-}
-```
-
-**Important**: `spec.clusterID` must be a valid RFC4122 UUID (hex chars only, 8-4-4-4-12 format). Generate one with:
+#### Get cluster details
 
 ```bash
-python3 -c "import uuid; print(uuid.uuid4())"
+CLUSTER_ID="019df41a-e34c-7595-a3d6-e143f28eb106"
+
+curl -s "http://localhost:8000/api/hyperfleet/v1/clusters/${CLUSTER_ID}" | python3 -m json.tool
 ```
 
-### Step 3: Create the Cluster
+#### Get adapter statuses (the key endpoint)
 
 ```bash
-./create-cluster.sh hc-test12-payload.json
-```
-
-Or manually:
-
-```bash
-curl -s -X POST http://localhost:8000/api/hyperfleet/v1/clusters \
-  -H "Content-Type: application/json" \
-  -d @hc-test12-payload.json | python3 -m json.tool
-```
-
-### Step 4: Monitor Adapter Statuses
-
-After creation, the Sentinel publishes a `Cluster.reconcile` event. All three adapters receive it, but only `adapter-placement-job` will proceed initially (the others gate on placement + signing key).
-
-```bash
-# Check cluster list via API
-curl -s http://localhost:8000/api/hyperfleet/v1/clusters | python3 -m json.tool
-
-# Check adapter statuses for a specific cluster
-CLUSTER_ID="<cluster-id-from-api>"
 curl -s "http://localhost:8000/api/hyperfleet/v1/clusters/${CLUSTER_ID}/statuses" | python3 -m json.tool
 ```
 
-Expected progression:
-1. `adapter-placement-job`: Applied=True, Available=True, data.managementClusterName=`<mc-name>`
-2. `adapter-signing-key`: Applied=True, Available=True (keygen Job completed)
-3. `adapter-hc`: Applied=True → Available=True (HostedCluster becomes available, may take 10-20 min)
+This returns all adapter reports for the cluster. Each adapter reports:
+- **conditions**: `Applied`, `Available`, `Health` (each True/False/Unknown)
+- **data**: adapter-specific output (MC name, API endpoint, etc.)
+- **observed_generation**: which cluster generation was processed
 
-### Step 5: Check Adapter Logs
+#### Look up cluster by name
 
 ```bash
-# Placement adapter
-kubectl logs -n hyperfleet -l app.kubernetes.io/instance=adapter-placement-job --tail=100
-
-# Signing key adapter
-kubectl logs -n hyperfleet -l app.kubernetes.io/instance=adapter-signing-key --tail=100
-
-# HC adapter
-kubectl logs -n hyperfleet -l app.kubernetes.io/instance=adapter-hc --tail=100
-
-# Placement Job output (after it runs)
-kubectl logs -n hyperfleet -l app=placement-job --tail=100
+curl -s "http://localhost:8000/api/hyperfleet/v1/clusters?search=name+%3D+%27hctest27%27" | python3 -m json.tool
 ```
 
-### Step 6: Verify on Management Cluster
+#### List all clusters
 
-Switch to the management cluster and check:
+```bash
+curl -s "http://localhost:8000/api/hyperfleet/v1/clusters" | python3 -m json.tool
+```
+
+### Expected Adapter Status Progression
+
+After cluster creation, adapters execute in order. Check the `/statuses` endpoint periodically.
+
+**1. Placement adapter** (seconds):
+
+```json
+{
+  "adapter": "placement-adapter",
+  "conditions": [
+    { "type": "Applied",   "status": "True", "reason": "JobApplied" },
+    { "type": "Available", "status": "True", "reason": "PlacementDecided" },
+    { "type": "Health",    "status": "True", "reason": "Healthy" }
+  ],
+  "data": {
+    "managementClusterName": "dev-mgt-us-c1-ckandagb3fc",
+    "managementClusterNamespace": "clusters-019df41a-e34c-7595-a3d6-e143f28eb106",
+    "baseDomain": "us-central1-ckandagb3fc-1.dev.gcp-hcp.devshift.net"
+  }
+}
+```
+
+**2. HC adapter** (seconds for Applied, 10-20 min for Available):
+
+```json
+{
+  "adapter": "hc-adapter",
+  "conditions": [
+    { "type": "Applied",   "status": "True",  "reason": "AppliedManifestWorkComplete" },
+    { "type": "Available", "status": "False", "reason": "HostedClusterNotAvailable" },
+    { "type": "Health",    "status": "False", "reason": "HostedClusterDegraded" }
+  ],
+  "data": {
+    "hostedCluster": {
+      "name": "hctest27",
+      "apiEndpoint": "https://api.hctest27-user.us-central1-...",
+      "version": ""
+    }
+  }
+}
+```
+
+Once the HostedCluster finishes provisioning (10-20 min), `Available` and `Health` flip to `True`.
+
+### Verifying on the Management Cluster
+
+After placement succeeds, switch to the MC to inspect the actual resources:
 
 ```bash
 # Login to MC
-bash /Users/ckandaga/gcp-hcp/repos/ck-gcp-hcp-infra/terraform/config/dev-all-in-one/ckandag/login-management.sh
+bash /path/to/login-management.sh
 
 # Check HostedClusters
 kubectl get hostedclusters -A
 
-# Check namespaces for your cluster
-kubectl get ns | grep clusters-
-
-# Check resources in the cluster namespace
+# Check the cluster namespace
 kubectl get all,secrets,certificates -n clusters-<cluster-id>
 
-# Check Maestro agent logs for ManifestWork apply status
-kubectl logs -n maestro -l app=maestro-agent --tail=200
+# Check Maestro agent status
+kubectl logs -n maestro -l app=maestro-agent --tail=50
+```
+
+### Login to the Hosted Cluster
+
+Once `hc-adapter` reports `Available=True`:
+
+```bash
+./login-cluster.sh hctest27
+# or by ID:
+./login-cluster.sh 019df41a-e34c-7595-a3d6-e143f28eb106
+```
+
+---
+
+## Quick Reference Commands
+
+### Status Checks (Region Cluster)
+
+```bash
+# Port-forward to API
+kubectl port-forward svc/hyperfleet-api 8000:8000 -n hyperfleet &
+
+# List clusters
+curl -s http://localhost:8000/api/hyperfleet/v1/clusters | python3 -m json.tool
+
+# Get cluster by ID
+curl -s http://localhost:8000/api/hyperfleet/v1/clusters/${CLUSTER_ID} | python3 -m json.tool
+
+# Get adapter statuses — THE primary status check
+curl -s http://localhost:8000/api/hyperfleet/v1/clusters/${CLUSTER_ID}/statuses | python3 -m json.tool
+
+# Search by name
+curl -s "http://localhost:8000/api/hyperfleet/v1/clusters?search=name+%3D+%27hctest27%27" | python3 -m json.tool
+```
+
+### Deployment Checks (Region Cluster)
+
+```bash
+# All deployments with images
+kubectl get deployments -n hyperfleet \
+  -o custom-columns='NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image,READY:.status.readyReplicas'
+
+# ArgoCD application status
+kubectl get applications -n argocd \
+  -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status'
+
+# All pods
+kubectl get pods -n hyperfleet
+```
+
+### Management Cluster Checks
+
+```bash
+# HostedClusters
+kubectl get hostedclusters -A
+
+# Cluster namespaces
+kubectl get ns | grep clusters-
+
+# Resources in a cluster namespace
+kubectl get all,secrets,certificates -n clusters-<cluster-id>
+
+# Maestro agent logs
+kubectl logs -n maestro -l app=maestro-agent --tail=50
+```
+
+### Adapter Logs (when API status isn't enough)
+
+```bash
+# Placement adapter
+kubectl logs deploy/hyperfleet-placement-adapter-hyperfleet-adapter -n hyperfleet --tail=50
+
+# HC adapter
+kubectl logs deploy/hyperfleet-hc-adapter-hyperfleet-adapter -n hyperfleet --tail=50
+
+# Filter for a specific cluster
+kubectl logs deploy/hyperfleet-hc-adapter-hyperfleet-adapter -n hyperfleet --since=10m | grep <cluster-id>
+```
+
+### Maestro (Region Cluster)
+
+```bash
+# Port-forward to Maestro (separate from API)
+kubectl port-forward svc/maestro 8001:8000 -n hyperfleet &
+
+# List registered consumers (MCs)
+curl -s http://localhost:8001/api/maestro/v1/consumers | python3 -m json.tool
+
+# List resource bundles (ManifestWorks sent by adapters)
+curl -s http://localhost:8001/api/maestro/v1/resource-bundles | python3 -m json.tool
 ```
 
 ---
 
 ## Debugging
 
-### Common Issues
+### Adapter statuses endpoint returns 404
 
-#### HyperFleet API returns empty clusters / 500 errors
-The dev PostgreSQL uses ephemeral storage (no PVC). GKE Autopilot regularly rotates nodes, which kills the postgres pod and loses all data. The `db-migrate` init container re-creates the schema on restart, but cluster data is gone.
+The cluster may not exist or may have been lost to DB reset. List clusters first:
 
 ```bash
-# Check pod age (recently restarted = data lost)
+curl -s http://localhost:8000/api/hyperfleet/v1/clusters | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for c in data.get('items', []):
+    print(f\"{c['id']}  {c['name']}  gen={c['generation']}\")
+"
+```
+
+### Adapter statuses show empty `items: []`
+
+Adapters haven't processed the event yet. Wait 30-60 seconds for the sentinel to publish and adapters to pick up. If still empty after a few minutes, check adapter logs.
+
+### DB lost data (PostgreSQL pod restarted)
+
+Dev PostgreSQL uses ephemeral storage. Node rotation kills the pod and loses data. Re-create clusters after this happens.
+
+```bash
+# Check pod age
 kubectl get pods -n hyperfleet -l app.kubernetes.io/name=hyperfleet-api
-
-# If DB lost data, delete the API pod to trigger migration init container
-kubectl delete pod -n hyperfleet -l app.kubernetes.io/name=hyperfleet-api
 ```
 
-**Fix**: The hyperfleet-api Helm chart supports persistent storage via `database.postgresql.persistence.enabled`. Enable it to survive pod rescheduling:
+### HostedCluster validation error on MC
+
+If the HostedCluster fails to create on the MC, check events:
 
 ```bash
-helm upgrade hyperfleet-api <chart-path> \
-  --set database.postgresql.persistence.enabled=true \
-  --set database.postgresql.persistence.size=1Gi \
-  --reuse-values
+# Login to MC, then:
+kubectl get events -n clusters-<cluster-id> --sort-by=.lastTimestamp
 ```
 
-This creates a PVC with GKE's default `standard-rwo` storage class. Alternatively, for production use `database.external.enabled=true` with Cloud SQL.
+Common cause: `spec.clusterID` not a valid UUID. With API v0.2.1+, omitting `clusterID` from the payload works because `id` is now UUIDv7.
 
-#### Adapter events fail with "connection refused" to HyperFleet API
-The API pod was down when the adapter received events. Events are already consumed from Pub/Sub and won't be redelivered automatically. You need to re-create the cluster (or trigger a new reconcile event) to restart the adapter pipeline.
+### Adapter stuck on precondition
 
-#### HostedCluster validation error: "clusterID must be an RFC4122 UUID"
-The `spec.clusterID` in your payload must be a proper UUID (hex characters only, 8-4-4-4-12 format). Generate one with `python3 -c "import uuid; print(uuid.uuid4())"`.
-
-#### Adapter status stuck at "ManifestWorkNotApplied"
-This means the adapter sent the ManifestWork to Maestro, but the Maestro agent hasn't reported back yet. Check:
-
-1. **Maestro agent on the MC** — is the agent running and connected?
-   ```bash
-   # Login to MC, then:
-   kubectl logs -n maestro -l app=maestro-agent --tail=200
-   ```
-2. **Maestro consumer registration** — is the MC registered as a consumer?
-   ```bash
-   # From region cluster:
-   kubectl port-forward svc/maestro 8001:8000 -n hyperfleet &
-   curl -s http://localhost:8001/api/maestro/v1/consumers | python3 -m json.tool
-   ```
-3. **Pub/Sub subscriptions** — do per-MC subscriptions exist?
-   ```bash
-   gcloud pubsub subscriptions list --project=dev-reg-us-c1-ckandag910f | grep sourceevents
-   ```
-
-#### Placement job says "No MC secrets in Secret Manager"
-The regional GCP project needs secrets labeled with `maestro-consumer-name`. These are created by Terraform when provisioning an MC. Check:
+Adapters gate on predecessors. If HC adapter says "precondition not met", check placement status first:
 
 ```bash
-gcloud secrets list --project=dev-reg-us-c1-ckandag910f --filter='labels.maestro-consumer-name:*'
+curl -s http://localhost:8000/api/hyperfleet/v1/clusters/${CLUSTER_ID}/statuses | \
+  python3 -c "
+import json, sys
+for s in json.load(sys.stdin).get('items', []):
+    avail = next((c for c in s['conditions'] if c['type'] == 'Available'), {})
+    print(f\"{s['adapter']:30s} Available={avail.get('status','?'):5s} ({avail.get('reason','')})\")"
 ```
 
-#### Adapter pods not picking up config changes after `helm upgrade`
-Helm does not auto-restart pods when only ConfigMaps change. Always run `kubectl rollout restart` after upgrading adapter charts:
+### Config changes not taking effect
+
+Helm/ArgoCD doesn't auto-restart pods on ConfigMap changes. Always restart:
 
 ```bash
-kubectl rollout restart deploy/adapter-placement-job-hyperfleet-adapter -n hyperfleet
-```
-
-### Useful Commands
-
-```bash
-# List all pods in hyperfleet namespace
-kubectl get pods -n hyperfleet
-
-# Check Maestro consumers (from region cluster, separate port from HyperFleet API)
-kubectl port-forward svc/maestro 8001:8000 -n hyperfleet &
-curl -s http://localhost:8001/api/maestro/v1/consumers | python3 -m json.tool
-
-# Check all adapter deployments
-kubectl get deploy -n hyperfleet | grep adapter
-
-# Watch placement jobs
-kubectl get jobs -n hyperfleet -l hyperfleet.io/managed-by=adapter-placement-job
-
-# Check Maestro resource bundles (ManifestWorks sent by adapters)
-curl -s http://localhost:8001/api/maestro/v1/resource-bundles | python3 -m json.tool
-
-# Tail all adapter logs simultaneously
-kubectl logs -n hyperfleet -l app.kubernetes.io/component=adapter --tail=50 -f
+kubectl rollout restart deployment/<component> -n hyperfleet
+kubectl rollout status deployment/<component> -n hyperfleet --timeout=60s
 ```
 
 ---
 
-## References
+## Scripts Reference
 
-### Implementation Plans
-- [GCP-478: Adapter Design](../../../ck-gcp-hcp/implementation-plans/gcp-478-hyperfleet-adapters.md)
-- [GCP-334: Maestro Setup](../../../ck-gcp-hcp/implementation-plans/gcp-334-hyperfleet-maestro-setup.md)
+| Script | Purpose |
+|---|---|
+| `setup-infra.sh <id> <project>` | Create WIF pool, IAM SAs, VPC for a cluster |
+| `gen-payload.sh <name> [opts]` | Generate cluster creation JSON payload |
+| `create-cluster.sh <payload.json>` | POST payload to HyperFleet API |
+| `e2e-create-cluster.sh <name> <project>` | All-in-one: infra + payload + create |
+| `login-cluster.sh <name-or-id>` | Configure kubectl for a hosted cluster |
 
-### Local Repositories
+---
 
-| Repo | Local Path | Purpose |
-|------|-----------|---------|
-| **ck-gcp-adapters** | `/Users/ckandaga/gcp-hcp/repos/ck-gcp-adapters` | GCP adapter Helm charts (this repo) |
-| **ck-maestro** | `/Users/ckandaga/gcp-hcp/repos/ck-maestro` | Maestro server + agent (fork) |
-| **hyperfleet-adapter** | `/Users/ckandaga/gcp-hcp/repos/hyperfleet-adapter` | Adapter framework binary (shared by all adapters) |
-| **hyperfleet-api** | `/Users/ckandaga/gcp-hcp/repos/hyperfleet-api` | HyperFleet REST API |
-| **hyperfleet-sentinel** | `/Users/ckandaga/gcp-hcp/repos/hyperfleet-sentinel` | Sentinel — watches API, publishes events to Pub/Sub |
-| **hyperfleet-chart** | `/Users/ckandaga/gcp-hcp/repos/hyperfleet-chart` | Umbrella Helm chart for HyperFleet deployment |
-| **hyperfleet-architecture** | `/Users/ckandaga/gcp-hcp/repos/hyperfleet-architecture` | Architecture docs, adapter framework design, Maestro integration guide |
-| **ck-gcp-hcp-infra** | `/Users/ckandaga/gcp-hcp/repos/ck-gcp-hcp-infra` | Terraform modules, ArgoCD configs, Helm charts for GCP HCP infrastructure |
-| **ck-gcp-hcp** | `/Users/ckandaga/gcp-hcp/repos/ck-gcp-hcp` | GCP HCP team workspace — implementation plans, scripts |
+## OIDC Document Storage (GCS Bucket + Proxy)
 
-### Upstream
-- [HyperFleet Architecture](https://github.com/openshift-hyperfleet/architecture)
-- [Adapter Framework](https://github.com/openshift-hyperfleet/architecture/tree/main/hyperfleet/components/adapter/framework)
-- [Maestro Upstream](https://github.com/openshift-online/maestro)
+### Background
+
+For Workload Identity Federation (WIF) to work, GCP STS needs to fetch OIDC discovery documents from a publicly accessible HTTPS URL. The HyperShift Operator uploads these documents to a GCS bucket, and an nginx proxy pod fronts the private bucket to make them publicly reachable.
+
+### How It Works
+
+```
+GCP STS / Any Client
+        │
+        ▼  (HTTPS)
+GKE Ingress (Google-managed cert + global static IP)
+        │
+        ▼  (HTTP)
+K8s Service → oidc-proxy pods (nginx + GCS Fuse CSI sidecar)
+        │
+        ▼  (Workload Identity)
+Private GCS Bucket: dev-mgt-us-c1-ckandagb3fc-oidc-proxy-test
+  ├── {infraID}/.well-known/openid-configuration
+  └── {infraID}/openid/v1/jwks
+```
+
+The proxy pod runs in `oidc-system` namespace on the **management cluster**. It mounts the GCS bucket via GCS Fuse CSI driver (read-only) and serves documents through nginx.
+
+### Key Resources
+
+| Resource | Value |
+|---|---|
+| GCS Bucket | `dev-mgt-us-c1-ckandagb3fc-oidc-proxy-test` |
+| Proxy namespace | `oidc-system` (on MC) |
+| Proxy deployment | `oidc-proxy` (2 replicas) |
+| Public endpoint | `https://oidc.dev-reg-us-c1-ckandagb3fc.dev.gcp-hcp.devshift.net/{infraID}` |
+| MC project | `dev-mgt-us-c1-ckandagb3fc` |
+
+### HyperShift Operator Configuration
+
+The HO needs the `--gcp-oidc-storage-bucket-name` flag to enable OIDC document upload. This is configured in the ArgoCD template for HyperShift on the MC:
+
+**File**: `ck-gcp-hcp-infra/.worktree/dev-ckandag/argocd/config/management-cluster/hypershift/template.yaml`
+
+The kustomize patch adds the arg to the operator Deployment:
+
+```yaml
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --gcp-oidc-storage-bucket-name=dev-mgt-us-c1-ckandagb3fc-oidc-proxy-test
+```
+
+Without this flag, the HO skips OIDC upload and logs an error (which doesn't surface as a visible condition).
+
+### How the HO Upload Works (`gcp_oidc.go`)
+
+On each HostedCluster reconcile, the HO checks:
+
+1. If `ServiceAccountSigningKey` is set → **skip** (client manages OIDC docs)
+2. If finalizer `hypershift.io/gcp-oidc-discovery` is present → **skip** (already uploaded)
+3. If bucket name or GCS client is not configured → **error** (no-op without the flag)
+4. Waits for `sa-signing-key` secret in the HCP namespace (contains the public key)
+5. Generates OIDC discovery document and JWKS from the public key
+6. Uploads to GCS: `gs://{bucket}/{infraID}/.well-known/openid-configuration` and `gs://{bucket}/{infraID}/openid/v1/jwks`
+7. Adds finalizer `hypershift.io/gcp-oidc-discovery` to the HostedCluster
+
+On deletion, the finalizer triggers cleanup — deletes the objects from GCS before removing the finalizer.
+
+### Verifying OIDC Upload
+
+```bash
+# Check finalizer on the HostedCluster (on MC)
+kubectl get hostedcluster <name> -n clusters-<id> -o jsonpath='{.metadata.finalizers}'
+# Should contain: hypershift.io/gcp-oidc-discovery
+
+# Check GCS bucket contents
+gcloud storage ls gs://dev-mgt-us-c1-ckandagb3fc-oidc-proxy-test/<infraID>/
+
+# View the discovery document
+gcloud storage cat gs://dev-mgt-us-c1-ckandagb3fc-oidc-proxy-test/<infraID>/.well-known/openid-configuration
+
+# Test via public proxy endpoint
+curl -s https://oidc.dev-reg-us-c1-ckandagb3fc.dev.gcp-hcp.devshift.net/<infraID>/.well-known/openid-configuration | python3 -m json.tool
+```
+
+### Cluster Creation: With vs Without Signing Key
+
+| Flag | OIDC Behavior | Use Case |
+|---|---|---|
+| `--signing-key` | Client provides key; HO **skips** OIDC upload | Legacy / client-managed OIDC |
+| (no flag) | HO generates key, uploads OIDC docs to GCS | **Recommended** — HO manages OIDC lifecycle |
+
+For testing HO-managed OIDC, create clusters **without** `--signing-key`:
+
+```bash
+./e2e-create-cluster.sh hctest31 ck-hcp-test
+```
+
+### IssuerURL Mismatch (Known Issue)
+
+The `gen-payload.sh` script currently generates `issuerURL` as `https://storage.googleapis.com/{infraID}-oidc-issuer` (direct GCS URL). However, the actual documents are served via the proxy at `https://oidc.dev-reg-us-c1-ckandagb3fc.dev.gcp-hcp.devshift.net/{infraID}`. For STS to resolve correctly, the `issuerURL` in the HostedCluster spec should match the proxy endpoint. This needs to be fixed in `gen-payload.sh` for production use.
+
+### Architecture Reference
+
+See `ck-gcp-hcp/experiments/gcp-588-public-bucket/README.md` for the full design doc covering:
+- Why public access is needed (GCP STS makes unauthenticated HTTPS requests)
+- Org policy constraints blocking `allUsers` and CDN approaches
+- The proxy pod workaround (current solution)
+- CDN approach (blocked, pending org policy change)
+
+---
+
+## Repositories
+
+| Repo | Purpose |
+|---|---|
+| **ck-gcp-hcp-infra** | Terraform + ArgoCD configs + Helm charts for infra |
+| **hyperfleet-api** | HyperFleet REST API |
+| **hyperfleet-sentinel** | Sentinel (watches API, publishes events) |
+| **hyperfleet-adapter** | Adapter framework binary |
+| **hyperfleet-chart** | Umbrella Helm chart |
+| **ck-hypershift** | HyperShift operator (fork) |
+| **ck-maestro** | Maestro server + agent (fork) |

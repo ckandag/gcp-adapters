@@ -16,6 +16,7 @@
 #   --subnet <name>           Subnet name (default: from infra-config.json)
 #   --endpoint-access <mode>  Private or PublicAndPrivate (default: PublicAndPrivate)
 #   --signing-key             Include base64-encoded signing key in spec.signingKey
+#   --issuer-base-url <url>   Base URL for OIDC issuer (default: proxy endpoint)
 #   --label <key=value>       Add a label (repeatable)
 #   --test-label <value>      Shorthand for --label test=<value>
 #   --output <path>           Output file path (default: <cluster-name>-payload.json)
@@ -49,6 +50,7 @@ NETWORK_OVERRIDE=""
 SUBNET_OVERRIDE=""
 ENDPOINT_ACCESS="PublicAndPrivate"
 INCLUDE_SIGNING_KEY=false
+ISSUER_BASE_URL="https://oidc.dev-reg-us-c1-ckandagb3fc.dev.gcp-hcp.devshift.net"
 OUTPUT_FILE=""
 EXTRA_LABELS=()
 
@@ -59,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --subnet)        SUBNET_OVERRIDE="$2"; shift 2 ;;
     --endpoint-access) ENDPOINT_ACCESS="$2"; shift 2 ;;
     --signing-key)   INCLUDE_SIGNING_KEY=true; shift ;;
+    --issuer-base-url) ISSUER_BASE_URL="$2"; shift 2 ;;
     --label)         EXTRA_LABELS+=("$2"); shift 2 ;;
     --test-label)    EXTRA_LABELS+=("test=$2"); shift 2 ;;
     --output)        OUTPUT_FILE="$2"; shift 2 ;;
@@ -96,11 +99,12 @@ endpoint       = sys.argv[3]
 network_ovr    = sys.argv[4]
 subnet_ovr     = sys.argv[5]
 include_key    = sys.argv[6] == 'true'
-output_file    = sys.argv[7]
-iam_path       = sys.argv[8]
-infra_path     = sys.argv[9]
-key_path       = sys.argv[10]
-extra_labels   = sys.argv[11:]
+issuer_base    = sys.argv[7]
+output_file    = sys.argv[8]
+iam_path       = sys.argv[9]
+infra_path     = sys.argv[10]
+key_path       = sys.argv[11]
+extra_labels   = sys.argv[12:]
 
 # Load IAM config
 with open(iam_path) as f:
@@ -136,7 +140,7 @@ payload = {
     'labels': labels,
     'spec': {
         'infraID': infra_id,
-        'issuerURL': f'https://hypershift-{infra_id}-oidc' if include_key else f'https://storage.googleapis.com/{infra_id}-oidc-issuer',
+        'issuerURL': f'https://hypershift-{infra_id}-oidc' if include_key else f'{issuer_base}/{infra_id}',
         'platform': {
             'type': 'GCP',
             'gcp': {
@@ -155,11 +159,12 @@ payload = {
                         'cloudControllerEmail': sas.get('cloud-controller', ''),
                         'storageEmail':         sas.get('gcp-pd-csi', ''),
                         'imageRegistryEmail':    sas.get('image-registry', ''),
+                        'networkEmail':          sas.get('cloud-network', ''),
                     },
                 },
             },
         },
-        'clusterID': str(uuid.uuid4()),
+        # 'clusterID': str(uuid.uuid4()),  # commented out to test server-side generation
     },
     'kind': 'Cluster',
 }
@@ -180,7 +185,8 @@ print(f'  Project  : {project_id}')
 print(f'  Region   : {region}')
 print(f'  Network  : {network}')
 print(f'  Subnet   : {subnet}')
-print(f'  ClusterID: {payload[\"spec\"][\"clusterID\"]}')
+print(f'  IssuerURL: {payload[\"spec\"][\"issuerURL\"]}')
+print(f'  ClusterID: {payload[\"spec\"].get(\"clusterID\", \"(not set - server should generate)\")}')
 if include_key:
     print(f'  SigningKey: included')
 " \
@@ -190,6 +196,7 @@ if include_key:
   "$NETWORK_OVERRIDE" \
   "$SUBNET_OVERRIDE" \
   "$INCLUDE_SIGNING_KEY" \
+  "$ISSUER_BASE_URL" \
   "$OUTPUT_FILE" \
   "$IAM_CONFIG" \
   "$INFRA_CONFIG" \
