@@ -17,6 +17,10 @@
 #   --endpoint-access <mode>  Private or PublicAndPrivate (default: PublicAndPrivate)
 #   --signing-key             Include base64-encoded signing key in spec.signingKey
 #   --issuer-base-url <url>   Base URL for OIDC issuer (default: proxy endpoint)
+#   --version <ver>           OCP version string for spec.release.version (e.g. 4.22.0-ec.4)
+#   --channel-group <group>   Cincinnati channel group for spec.release.channelGroup
+#                             (e.g. stable, fast, candidate, eus). Required by the
+#                             version-resolution-adapter to resolve release images.
 #   --label <key=value>       Add a label (repeatable)
 #   --test-label <value>      Shorthand for --label test=<value>
 #   --output <path>           Output file path (default: <cluster-name>-payload.json)
@@ -31,6 +35,9 @@
 #   # Override network (e.g. using MC's existing VPC)
 #   ./gen-payload.sh hctest20 \
 #     --network dev-mgt-us-c1-vpc --subnet dev-mgt-us-c1-vpc-psc-subnet-0
+#
+#   # Include version + channelGroup for version-resolution-adapter
+#   ./gen-payload.sh hctest20 --version 4.22.0-ec.4 --channel-group candidate
 #
 #   # Include the signing key so adapter-signing-key uses it instead of generating
 #   ./gen-payload.sh hctest20 --signing-key --test-label "e2e-v2"
@@ -51,6 +58,8 @@ SUBNET_OVERRIDE=""
 ENDPOINT_ACCESS="PublicAndPrivate"
 INCLUDE_SIGNING_KEY=false
 ISSUER_BASE_URL="https://oidc.dev-reg-us-c1-ckandagb3fc.dev.gcp-hcp.devshift.net"
+RELEASE_VERSION=""
+CHANNEL_GROUP=""
 OUTPUT_FILE=""
 EXTRA_LABELS=()
 
@@ -62,6 +71,8 @@ while [[ $# -gt 0 ]]; do
     --endpoint-access) ENDPOINT_ACCESS="$2"; shift 2 ;;
     --signing-key)   INCLUDE_SIGNING_KEY=true; shift ;;
     --issuer-base-url) ISSUER_BASE_URL="$2"; shift 2 ;;
+    --version)         RELEASE_VERSION="$2"; shift 2 ;;
+    --channel-group)   CHANNEL_GROUP="$2"; shift 2 ;;
     --label)         EXTRA_LABELS+=("$2"); shift 2 ;;
     --test-label)    EXTRA_LABELS+=("test=$2"); shift 2 ;;
     --output)        OUTPUT_FILE="$2"; shift 2 ;;
@@ -70,6 +81,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 INFRA_ID="${INFRA_ID:-$CLUSTER_NAME}"
+
+if [[ -z "$RELEASE_VERSION" || -z "$CHANNEL_GROUP" ]]; then
+  echo "ERROR: --version and --channel-group are required."
+  echo "  Example: $0 $CLUSTER_NAME --version 4.18.0 --channel-group stable"
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Locate input files
@@ -103,8 +120,10 @@ issuer_base    = sys.argv[7]
 output_file    = sys.argv[8]
 iam_path       = sys.argv[9]
 infra_path     = sys.argv[10]
-key_path       = sys.argv[11]
-extra_labels   = sys.argv[12:]
+key_path        = sys.argv[11]
+release_version = sys.argv[12]
+channel_group   = sys.argv[13]
+extra_labels    = sys.argv[14:]
 
 # Load IAM config
 with open(iam_path) as f:
@@ -165,6 +184,10 @@ payload = {
             },
         },
         # 'clusterID': str(uuid.uuid4()),  # commented out to test server-side generation
+        'release': {
+            'version': release_version,
+            'channelGroup': channel_group,
+        },
     },
     'kind': 'Cluster',
 }
@@ -187,6 +210,7 @@ print(f'  Network  : {network}')
 print(f'  Subnet   : {subnet}')
 print(f'  IssuerURL: {payload[\"spec\"][\"issuerURL\"]}')
 print(f'  ClusterID: {payload[\"spec\"].get(\"clusterID\", \"(not set - server should generate)\")}')
+print(f'  Release  : version={release_version} channelGroup={channel_group}')
 if include_key:
     print(f'  SigningKey: included')
 " \
@@ -201,4 +225,6 @@ if include_key:
   "$IAM_CONFIG" \
   "$INFRA_CONFIG" \
   "$SIGNING_KEY_B64" \
+  "$RELEASE_VERSION" \
+  "$CHANNEL_GROUP" \
   "${EXTRA_LABELS[@]+"${EXTRA_LABELS[@]}"}"

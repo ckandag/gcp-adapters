@@ -11,11 +11,13 @@
 #   --subnet <name>           Override subnet name
 #   --endpoint-access <mode>  Private or PublicAndPrivate (default: PublicAndPrivate)
 #   --signing-key             Include signing key in payload
+#   --version <ver>           OCP version for spec.release.version (e.g. 4.22.0-ec.4)
+#   --channel-group <group>   Cincinnati channel group (e.g. stable, candidate)
 #   --test-label <value>      Set the test label
 #
 # Example:
-#   ./e2e-create-cluster.sh hctest20 ck-hcp-test
-#    
+#   ./e2e-create-cluster.sh hctest20 my-project --version 4.22.0-ec.4 --channel-group candidate
+#
 
 set -euo pipefail
 
@@ -34,7 +36,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --region)           REGION="$2"; shift 2 ;;
     --vpc-cidr)         VPC_CIDR="$2"; shift 2 ;;
-    --network|--subnet|--endpoint-access|--test-label)
+    --network|--subnet|--endpoint-access|--test-label|--version|--channel-group)
                         GEN_ARGS+=("$1" "$2"); shift 2 ;;
     --signing-key)      GEN_ARGS+=("$1"); shift ;;
     *) echo "Unknown option: $1"; exit 1 ;;
